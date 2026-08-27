@@ -1,0 +1,970 @@
+type tie<class>
+// tiedb/src/zd.tie —— tie:zd 二进制序列化格式库（namespace zd，纯 tie 全新实现）
+// ============================================================================
+// 格式契约（docs/plans/tiedb.md §2，MessagePack 分区 + Protobuf varint 思路）：
+//   fixint 0x00-0x7f（正）/ 0xe0-0xff（负 -32..-1）；定宽 0xcc u8 / 0xcd u16 /
+//   0xce u32 / 0xcf u64 / 0xd0 i8 / 0xd1 i16 / 0xd2 i32 / 0xd3 i64（大端）；
+//   浮点 0xca f32 / 0xcb f64；布尔 0xc2/0xc3；字符串 0xa0-0xbf fixstr /
+//   0xd9 str8 / 0xda str16 / 0xdb str32（长度=UTF-8 字节数）；数组 0x90-0x9f /
+//   0xdc / 0xdd；map 0x80-0x8f / 0xde / 0xdf；tie 扩展 0xc4 char（i32 码点）、
+//   0xc5 trit（i8）。record 字段 = varint tag(field_no<<3|wire_type) + 值。
+//   文件头魔数 "TIEDBZD" + 版本 1（8 字节）。
+//
+// v2 实现说明（相对旧实现的现代化）：
+//   - 字节读取用 str_byte 直访内部字节 + utf8_seq_len 处理多字节（不再
+//     str_char+char_code 绕路）；
+//   - f64 IEEE 754 位模式：语言暂无 f64 bitcast 原语，沿用数学分解方案
+//     （frexp 式分解 + 尾数逐位提取，全链路精确；次正规数简化为 ±0）；
+//   - map 序列化接口为平行表（键表+值表）：tie 当前无 map 键枚举 API；
+//   - 异构数组用 encode_array(n, body)（元素自带类型标签，自描述）。
+
+namespace zd {
+
+// ---------- 字节工具 ----------
+
+// concat：拼接两个字节表。byte_concat 原语封装（形参用裸 table 匹配原语约束）。
+pub func concat(a: table, b: table) -> table<i64> {
+    return byte_concat(a, b)
+}
+
+// slice：拷贝字节表 [start, end)，越界自动夹取。
+pub func slice(t: table<i64>, start: i64, end: i64) -> table<i64> {
+    var out = table_new_i64()
+    var n: i64 = len(t)
+    var i: i64 = start
+    if i < 0 {
+        i = 0
+    }
+    if end > n {
+        end = n
+    }
+    while i < end {
+        table_push(out, t[i])
+        i = i + 1
+    }
+    return out
+}
+
+// u8_at：读 pos 字节，越界返回 -1 哨兵（解码层统一边界入口）。
+pub func u8_at(t: table<i64>, pos: i64) -> i64 {
+    if pos < 0 || pos >= len(t) {
+        return -1
+    }
+    return t[pos]
+}
+
+// ---------- 大端定宽写入 ----------
+
+pub func write_u16_be(n: i64) -> table<i64> {
+    var out = table_new_i64()
+    table_push(out, (n >> 8) & 0xFF)
+    table_push(out, n & 0xFF)
+    return out
+}
+
+pub func write_u32_be(n: i64) -> table<i64> {
+    var out = table_new_i64()
+    table_push(out, (n >> 24) & 0xFF)
+    table_push(out, (n >> 16) & 0xFF)
+    table_push(out, (n >> 8) & 0xFF)
+    table_push(out, n & 0xFF)
+    return out
+}
+
+pub func write_u64_be(n: i64) -> table<i64> {
+    var out = table_new_i64()
+    var i: i64 = 7
+    while i >= 0 {
+        table_push(out, (n >> (i * 8)) & 0xFF)
+        i = i - 1
+    }
+    return out
+}
+
+pub func read_u16_be(t: table<i64>, pos: i64) -> (i64, i64) {
+    if pos < 0 || pos + 1 >= len(t) {
+        return (0, -1)
+    }
+    return ((t[pos] << 8) | t[pos + 1], pos + 2)
+}
+
+pub func read_u32_be(t: table<i64>, pos: i64) -> (i64, i64) {
+    if pos < 0 || pos + 3 >= len(t) {
+        return (0, -1)
+    }
+    return (((t[pos] << 24) | (t[pos + 1] << 16)) | ((t[pos + 2] << 8) | t[pos + 3]), pos + 4)
+}
+
+pub func read_u64_be(t: table<i64>, pos: i64) -> (i64, i64) {
+    if pos < 0 || pos + 7 >= len(t) {
+        return (0, -1)
+    }
+    var v: i64 = 0
+    var i: i64 = 0
+    while i < 8 {
+        v = (v << 8) | (t[pos + i] & 0xFF)
+        i = i + 1
+    }
+    return (v, pos + 8)
+}
+
+// ---------- f64 IEEE 754 位模式（数学分解；语言暂无 bitcast） ----------
+// 常规数：e=floor(log2|x|)（log2 ±1 误差用 m∈[1,2) 校正），m=|x|/2^e 精确，
+// 尾数 52 位逐位提取（中间值恒为 k/2^j 精确可表示）。次正规数简化为 ±0。
+
+func f64_bits(x: f64) -> i64 {
+    var min_i64: i64 = 0 - 9223372036854775807 - 1  // -2^63（字面量安全构造）
+    if x != x {
+        return 0x7FF8000000000000
+    }
+    if x == 0.0 {
+        if 1.0 / x < 0.0 {
+            return min_i64
+        }
+        return 0
+    }
+    var maxd: f64 = parse_float("1.7976931348623157e308")
+    if x > maxd {
+        return 0x7FF0000000000000
+    }
+    if x < -maxd {
+        return min_i64 + 0x7FF0000000000000  // 0xFFF0.. 位模式
+    }
+    var sign: i64 = 0
+    var ax: f64 = x
+    if x < 0.0 {
+        sign = 1
+        ax = -ax
+    }
+    var e: f64 = floor(log(ax) / log(2.0))
+    var e2: i64 = parse_int(to_string(e))
+    var m: f64 = ax / pow(2.0, e)
+    if m >= 2.0 {
+        e2 = e2 + 1
+        m = m / 2.0
+    }
+    if m < 1.0 {
+        e2 = e2 - 1
+        m = m * 2.0
+    }
+    var frac: f64 = m - 1.0
+    var mant: i64 = 0
+    var i: i64 = 0
+    while i < 52 {
+        frac = frac * 2.0
+        if frac >= 1.0 {
+            mant = mant * 2 + 1
+            frac = frac - 1.0
+        } else {
+            mant = mant * 2
+        }
+        i = i + 1
+    }
+    var biased: i64 = e2 + 1023
+    if biased <= 0 {
+        return sign << 63
+    }
+    return (sign << 63) | (biased << 52) | mant
+}
+
+pub func write_f64_be(x: f64) -> table<i64> {
+    return write_u64_be(f64_bits(x))
+}
+
+pub func read_f64_be(t: table<i64>, pos: i64) -> (f64, i64) {
+    var (bits, p2) = read_u64_be(t, pos)
+    if p2 < 0 {
+        return (0.0, -1)
+    }
+    var sign: i64 = (bits >> 63) & 1
+    var biased: i64 = (bits >> 52) & 0x7FF
+    var mant: i64 = bits & 0xFFFFFFFFFFFFF
+    if biased == 0x7FF {
+        if mant == 0 {
+            if sign == 1 {
+                return (-1.0 / 0.0, p2)
+            }
+            return (1.0 / 0.0, p2)
+        }
+        return (parse_float("nan"), p2)
+    }
+    if biased == 0 {
+        if sign == 1 {
+            return (0.0 - 0.0 * 1.0 - 0.0, p2)
+        }
+        return (0.0, p2)
+    }
+    var mant_f: f64 = parse_float(to_string(mant)) / pow(2.0, 52.0)
+    var m: f64 = 1.0 + mant_f
+    var v: f64 = m * pow(2.0, biased - 1023)
+    if sign == 1 {
+        return (-v, p2)
+    }
+    return (v, p2)
+}
+
+// ---------- varint（Protobuf 7 位分组；zd 中用于 record 字段 tag） ----------
+
+pub func write_varint(n: i64) -> table<i64> {
+    var out = table_new_i64()
+    if n < 0 {
+        return out
+    }
+    var v: i64 = n
+    while v >= 0x80 {
+        table_push(out, (v & 0x7F) | 0x80)
+        v = v >> 7
+    }
+    table_push(out, v)
+    return out
+}
+
+pub func read_varint(t: table<i64>, pos: i64) -> (i64, i64) {
+    var v: i64 = 0
+    var shift: i64 = 0
+    var p: i64 = pos
+    var n: i64 = len(t)
+    while p < n {
+        var byte: i64 = t[p]
+        v = v | ((byte & 0x7F) << shift)
+        if (byte & 0x80) == 0 {
+            return (v, p + 1)
+        }
+        shift = shift + 7
+        if shift > 63 {
+            return (0, -1)
+        }
+        p = p + 1
+    }
+    return (0, -1)
+}
+
+// ---------- UTF-8 编解码（码点位运算；utf8_seq_len 判定多字节宽度） ----------
+
+pub func utf8_encode(s: string) -> table<i64> {
+    var out = table_new_i64()
+    var n: i64 = str_len(s)
+    var i: i64 = 0
+    while i < n {
+        var cp: i64 = char_code(str_char(s, i))
+        if cp < 0 {
+            i = i + 1
+            continue
+        }
+        if cp <= 0x7F {
+            table_push(out, cp)
+        } else if cp <= 0x7FF {
+            table_push(out, 0xC0 | (cp >> 6))
+            table_push(out, 0x80 | (cp & 0x3F))
+        } else if cp <= 0xFFFF {
+            if cp >= 0xD800 && cp <= 0xDFFF {
+                i = i + 1
+                continue
+            }
+            table_push(out, 0xE0 | (cp >> 12))
+            table_push(out, 0x80 | ((cp >> 6) & 0x3F))
+            table_push(out, 0x80 | (cp & 0x3F))
+        } else if cp <= 0x10FFFF {
+            table_push(out, 0xF0 | (cp >> 18))
+            table_push(out, 0x80 | ((cp >> 12) & 0x3F))
+            table_push(out, 0x80 | ((cp >> 6) & 0x3F))
+            table_push(out, 0x80 | (cp & 0x3F))
+        }
+        i = i + 1
+    }
+    return out
+}
+
+// utf8_decode：字节表 → (码点, 新位置)。非法输入返回 (-1, pos)。
+// 过编码/代理区/超上限/续字节不合法均拒绝。
+pub func utf8_decode(t: table<i64>, pos: i64) -> (i64, i64) {
+    var n: i64 = len(t)
+    if pos < 0 || pos >= n {
+        return (-1, pos)
+    }
+    var b0: i64 = t[pos]
+    if b0 <= 0x7F {
+        return (b0, pos + 1)
+    }
+    if b0 >= 0xC0 && b0 <= 0xDF {
+        if pos + 1 >= n {
+            return (-1, pos)
+        }
+        var b1: i64 = t[pos + 1]
+        if (b1 & 0xC0) != 0x80 {
+            return (-1, pos)
+        }
+        var cp: i64 = ((b0 & 0x1F) << 6) | (b1 & 0x3F)
+        if cp < 0x80 {
+            return (-1, pos)
+        }
+        return (cp, pos + 2)
+    }
+    if b0 >= 0xE0 && b0 <= 0xEF {
+        if pos + 2 >= n {
+            return (-1, pos)
+        }
+        var b1: i64 = t[pos + 1]
+        var b2: i64 = t[pos + 2]
+        if (b1 & 0xC0) != 0x80 || (b2 & 0xC0) != 0x80 {
+            return (-1, pos)
+        }
+        var cp: i64 = ((b0 & 0x0F) << 12) | ((b1 & 0x3F) << 6) | (b2 & 0x3F)
+        if cp < 0x800 || (cp >= 0xD800 && cp <= 0xDFFF) {
+            return (-1, pos)
+        }
+        return (cp, pos + 3)
+    }
+    if b0 >= 0xF0 && b0 <= 0xF7 {
+        if pos + 3 >= n {
+            return (-1, pos)
+        }
+        var b1: i64 = t[pos + 1]
+        var b2: i64 = t[pos + 2]
+        var b3: i64 = t[pos + 3]
+        if (b1 & 0xC0) != 0x80 || (b2 & 0xC0) != 0x80 || (b3 & 0xC0) != 0x80 {
+            return (-1, pos)
+        }
+        var cp: i64 = ((b0 & 0x07) << 18) | ((b1 & 0x3F) << 12) | ((b2 & 0x3F) << 6) | (b3 & 0x3F)
+        if cp < 0x10000 || cp > 0x10FFFF {
+            return (-1, pos)
+        }
+        return (cp, pos + 4)
+    }
+    return (-1, pos)
+}
+
+// ---------- 标量编码（最紧凑优先） ----------
+
+pub func encode_i64(n: i64) -> table<i64> {
+    var out = table_new_i64()
+    if n >= 0 && n <= 127 {
+        table_push(out, n)
+        return out
+    }
+    if n >= -32 && n < 0 {
+        table_push(out, n & 0xFF)
+        return out
+    }
+    if n >= -128 && n < -32 {
+        table_push(out, 0xD0)
+        table_push(out, n & 0xFF)
+        return out
+    }
+    if n >= 128 && n <= 255 {
+        table_push(out, 0xCC)
+        table_push(out, n)
+        return out
+    }
+    if n >= -32768 && n < -128 {
+        table_push(out, 0xD1)
+        return concat(out, write_u16_be(n & 0xFFFF))
+    }
+    if n >= 256 && n <= 65535 {
+        table_push(out, 0xCD)
+        return concat(out, write_u16_be(n))
+    }
+    if n >= -2147483648 && n < -32768 {
+        table_push(out, 0xD2)
+        return concat(out, write_u32_be(n & 0xFFFFFFFF))
+    }
+    if n >= 65536 && n <= 4294967295 {
+        table_push(out, 0xCE)
+        return concat(out, write_u32_be(n))
+    }
+    if n >= 0 {
+        table_push(out, 0xCF)
+        return concat(out, write_u64_be(n))
+    }
+    table_push(out, 0xD3)
+    return concat(out, write_u64_be(n))
+}
+
+pub func encode_f64(x: f64) -> table<i64> {
+    var out = table_new_i64()
+    table_push(out, 0xCB)
+    return concat(out, write_f64_be(x))
+}
+
+pub func encode_bool(b: bool) -> table<i64> {
+    var out = table_new_i64()
+    if b {
+        table_push(out, 0xC3)
+    } else {
+        table_push(out, 0xC2)
+    }
+    return out
+}
+
+// encode_char：单字符 string → 0xc4 + i32 码点大端。
+pub func encode_char(c: string) -> table<i64> {
+    var out = table_new_i64()
+    table_push(out, 0xC4)
+    var cp: i64 = char_code(c)
+    if cp < 0 {
+        cp = 0
+    }
+    return concat(out, write_u32_be(cp))
+}
+
+// encode_trit：-1/0/+1 → 0xc5 + i8。
+pub func encode_trit(v: i64) -> table<i64> {
+    var out = table_new_i64()
+    table_push(out, 0xC5)
+    table_push(out, v & 0xFF)
+    return out
+}
+
+// encode_string：UTF-8 字节长度前缀（fixstr ≤31 / str8 / str16 / str32）。
+pub func encode_string(s: string) -> table<i64> {
+    var body = utf8_encode(s)
+    var n: i64 = len(body)
+    var head = table_new_i64()
+    if n <= 31 {
+        table_push(head, 0xA0 | n)
+        return concat(head, body)
+    }
+    if n <= 255 {
+        table_push(head, 0xD9)
+        table_push(head, n)
+        return concat(head, body)
+    }
+    if n <= 65535 {
+        table_push(head, 0xDA)
+        return concat(concat(head, write_u16_be(n)), body)
+    }
+    table_push(head, 0xDB)
+    return concat(concat(head, write_u32_be(n)), body)
+}
+
+// ---------- 容器标签与组装 ----------
+
+func array_head(n: i64) -> table<i64> {
+    var out = table_new_i64()
+    if n <= 15 {
+        table_push(out, 0x90 | n)
+        return out
+    }
+    if n <= 65535 {
+        table_push(out, 0xDC)
+        return concat(out, write_u16_be(n))
+    }
+    table_push(out, 0xDD)
+    return concat(out, write_u32_be(n))
+}
+
+func map_head(n: i64) -> table<i64> {
+    var out = table_new_i64()
+    if n <= 15 {
+        table_push(out, 0x80 | n)
+        return out
+    }
+    if n <= 65535 {
+        table_push(out, 0xDE)
+        return concat(out, write_u16_be(n))
+    }
+    table_push(out, 0xDF)
+    return concat(out, write_u32_be(n))
+}
+
+// encode_array：通用组装——数组标签 + 元素字节（各元素自带类型标签）。
+pub func encode_array(n: i64, body: table<i64>) -> table<i64> {
+    return concat(array_head(n), body)
+}
+
+pub func encode_i64_array(t: table<i64>) -> table<i64> {
+    var n: i64 = len(t)
+    var body = table_new_i64()
+    var i: i64 = 0
+    while i < n {
+        body = concat(body, encode_i64(t[i]))
+        i = i + 1
+    }
+    return concat(array_head(n), body)
+}
+
+pub func encode_f64_array(t: table<f64>) -> table<i64> {
+    var n: i64 = len(t)
+    var body = table_new_i64()
+    var i: i64 = 0
+    while i < n {
+        body = concat(body, encode_f64(t[i]))
+        i = i + 1
+    }
+    return concat(array_head(n), body)
+}
+
+pub func encode_string_array(t: table<string>) -> table<i64> {
+    var n: i64 = len(t)
+    var body = table_new_i64()
+    var i: i64 = 0
+    while i < n {
+        body = concat(body, encode_string(t[i]))
+        i = i + 1
+    }
+    return concat(array_head(n), body)
+}
+
+// encode_tuple：元组按数组编码（自描述标签区分字段类型）。
+pub func encode_tuple(t: table<i64>) -> table<i64> {
+    return encode_i64_array(t)
+}
+
+// ---------- map 编码（平行表：键表+值表；tie 暂无 map 键枚举 API） ----------
+
+pub func encode_map_i64(keys: table<string>, vals: table<i64>) -> table<i64> {
+    var n: i64 = len(keys)
+    var body = table_new_i64()
+    var i: i64 = 0
+    while i < n {
+        body = concat(body, encode_string(keys[i]))
+        body = concat(body, encode_i64(vals[i]))
+        i = i + 1
+    }
+    return concat(map_head(n), body)
+}
+
+pub func encode_map_string(keys: table<string>, vals: table<string>) -> table<i64> {
+    var n: i64 = len(keys)
+    var body = table_new_i64()
+    var i: i64 = 0
+    while i < n {
+        body = concat(body, encode_string(keys[i]))
+        body = concat(body, encode_string(vals[i]))
+        i = i + 1
+    }
+    return concat(map_head(n), body)
+}
+
+pub func encode_map_bool(keys: table<string>, vals: table<bool>) -> table<i64> {
+    var n: i64 = len(keys)
+    var body = table_new_i64()
+    var i: i64 = 0
+    while i < n {
+        body = concat(body, encode_string(keys[i]))
+        body = concat(body, encode_bool(vals[i]))
+        i = i + 1
+    }
+    return concat(map_head(n), body)
+}
+
+// ---------- record 字段（Protobuf wire format） ----------
+
+pub func encode_field(field_no: i64, wire_type: i64, value_bytes: table<i64>) -> table<i64> {
+    return concat(write_varint((field_no << 3) | wire_type), value_bytes)
+}
+
+// decode_field：→ (field_no, wire_type, tag_end_pos, tag_end_pos)。
+// 值区间终点由调用方按 wire_type 推进。
+pub func decode_field(t: table<i64>, pos: i64) -> (i64, i64, i64, i64) {
+    var (tag, p2) = read_varint(t, pos)
+    if p2 < 0 {
+        return (0, 0, -1, -1)
+    }
+    return (tag >> 3, tag & 0x7, p2, p2)
+}
+
+// ---------- 标量解码 ----------
+
+pub func decode_i64(t: table<i64>, pos: i64) -> (i64, i64) {
+    var tag = u8_at(t, pos)
+    if tag < 0 {
+        return (0, -1)
+    }
+    if tag <= 0x7F {
+        return (tag, pos + 1)
+    }
+    if tag >= 0xE0 {
+        return (tag - 256, pos + 1)
+    }
+    if tag == 0xCC {
+        var v = u8_at(t, pos + 1)
+        if v < 0 {
+            return (0, -1)
+        }
+        return (v, pos + 2)
+    }
+    if tag == 0xCD {
+        var (v, p2) = read_u16_be(t, pos + 1)
+        if p2 < 0 {
+            return (0, -1)
+        }
+        return (v, p2)
+    }
+    if tag == 0xCE {
+        var (v, p2) = read_u32_be(t, pos + 1)
+        if p2 < 0 {
+            return (0, -1)
+        }
+        return (v, p2)
+    }
+    if tag == 0xCF {
+        return read_u64_be(t, pos + 1)
+    }
+    if tag == 0xD0 {
+        var v = u8_at(t, pos + 1)
+        if v < 0 {
+            return (0, -1)
+        }
+        if v >= 0x80 {
+            v = v - 256
+        }
+        return (v, pos + 2)
+    }
+    if tag == 0xD1 {
+        var (v, p2) = read_u16_be(t, pos + 1)
+        if p2 < 0 {
+            return (0, -1)
+        }
+        if v >= 0x8000 {
+            v = v - 0x10000
+        }
+        return (v, p2)
+    }
+    if tag == 0xD2 {
+        var (v, p2) = read_u32_be(t, pos + 1)
+        if p2 < 0 {
+            return (0, -1)
+        }
+        if v >= 0x80000000 {
+            v = v - 0x100000000
+        }
+        return (v, p2)
+    }
+    if tag == 0xD3 {
+        return read_u64_be(t, pos + 1)
+    }
+    return (0, -1)
+}
+
+pub func decode_f64(t: table<i64>, pos: i64) -> (f64, i64) {
+    if u8_at(t, pos) != 0xCB {
+        return (0.0, -1)
+    }
+    return read_f64_be(t, pos + 1)
+}
+
+pub func decode_bool(t: table<i64>, pos: i64) -> (i64, i64) {
+    var tag = u8_at(t, pos)
+    if tag == 0xC2 {
+        return (0, pos + 1)
+    }
+    if tag == 0xC3 {
+        return (1, pos + 1)
+    }
+    return (0, -1)
+}
+
+pub func decode_char(t: table<i64>, pos: i64) -> (string, i64) {
+    if u8_at(t, pos) != 0xC4 {
+        return ("", -1)
+    }
+    var (cp, p2) = read_u32_be(t, pos + 1)
+    if p2 < 0 {
+        return ("", -1)
+    }
+    return (str_from_code(cp), p2)
+}
+
+pub func decode_trit(t: table<i64>, pos: i64) -> (i64, i64) {
+    if u8_at(t, pos) != 0xC5 {
+        return (0, -1)
+    }
+    var v = u8_at(t, pos + 1)
+    if v < 0 {
+        return (0, -1)
+    }
+    if v >= 0x80 {
+        v = v - 256
+    }
+    return (v, pos + 2)
+}
+
+pub func decode_string(t: table<i64>, pos: i64) -> (string, i64) {
+    var tag = u8_at(t, pos)
+    if tag < 0 {
+        return ("", -1)
+    }
+    var n: i64 = -1
+    var dp: i64 = -1
+    if tag >= 0xA0 && tag <= 0xBF {
+        n = tag & 0x1F
+        dp = pos + 1
+    } else if tag == 0xD9 {
+        n = u8_at(t, pos + 1)
+        dp = pos + 2
+    } else if tag == 0xDA {
+        var (v, p2) = read_u16_be(t, pos + 1)
+        if p2 < 0 {
+            return ("", -1)
+        }
+        n = v
+        dp = p2
+    } else if tag == 0xDB {
+        var (v, p2) = read_u32_be(t, pos + 1)
+        if p2 < 0 {
+            return ("", -1)
+        }
+        n = v
+        dp = p2
+    } else {
+        return ("", -1)
+    }
+    if n < 0 {
+        return ("", -1)
+    }
+    var out: string = ""
+    var end: i64 = dp + n
+    var p: i64 = dp
+    while p < end {
+        var (cp, np) = utf8_decode(t, p)
+        if cp < 0 {
+            return ("", -1)
+        }
+        out = out + str_from_code(cp)
+        p = np
+    }
+    return (out, end)
+}
+
+// ---------- 容器解码 ----------
+
+// 读数组标签 → (元素个数, 数据起点)。非数组标签返回 (-1, -1)。
+pub func array_tag(t: table<i64>, pos: i64) -> (i64, i64) {
+    var tag = u8_at(t, pos)
+    if tag < 0 {
+        return (-1, -1)
+    }
+    if tag >= 0x90 && tag <= 0x9F {
+        return (tag & 0x0F, pos + 1)
+    }
+    if tag == 0xDC {
+        var (v, p2) = read_u16_be(t, pos + 1)
+        if p2 < 0 {
+            return (-1, -1)
+        }
+        return (v, p2)
+    }
+    if tag == 0xDD {
+        var (v, p2) = read_u32_be(t, pos + 1)
+        if p2 < 0 {
+            return (-1, -1)
+        }
+        return (v, p2)
+    }
+    return (-1, -1)
+}
+
+// 读 map 标签 → (条目数, 数据起点)。
+pub func map_tag(t: table<i64>, pos: i64) -> (i64, i64) {
+    var tag = u8_at(t, pos)
+    if tag < 0 {
+        return (-1, -1)
+    }
+    if tag >= 0x80 && tag <= 0x8F {
+        return (tag & 0x0F, pos + 1)
+    }
+    if tag == 0xDE {
+        var (v, p2) = read_u16_be(t, pos + 1)
+        if p2 < 0 {
+            return (-1, -1)
+        }
+        return (v, p2)
+    }
+    if tag == 0xDF {
+        var (v, p2) = read_u32_be(t, pos + 1)
+        if p2 < 0 {
+            return (-1, -1)
+        }
+        return (v, p2)
+    }
+    return (-1, -1)
+}
+
+// decode_table：数组 → (元素表, 新位置)。elem_kind：0=i64 1=f64 2=string 3=bool 8=trit。
+// 返回裸 table；bool 以 0/1 i64 承载。
+pub func decode_table(t: table<i64>, pos: i64, elem_kind: i64) -> (table, i64) {
+    var (n, dp) = array_tag(t, pos)
+    if n < 0 {
+        return (table_new_i64(), -1)
+    }
+    var p: i64 = dp
+    if elem_kind == 0 || elem_kind == 3 || elem_kind == 8 {
+        var out = table_new_i64()
+        var i: i64 = 0
+        while i < n {
+            var v: i64 = 0
+            if elem_kind == 0 {
+                var (a, np) = decode_i64(t, p)
+                if np < 0 {
+                    return (out, -1)
+                }
+                v = a
+                p = np
+            } else if elem_kind == 3 {
+                var (a, np) = decode_bool(t, p)
+                if np < 0 {
+                    return (out, -1)
+                }
+                v = a
+                p = np
+            } else {
+                var (a, np) = decode_trit(t, p)
+                if np < 0 {
+                    return (out, -1)
+                }
+                v = a
+                p = np
+            }
+            table_push(out, v)
+            i = i + 1
+        }
+        return (out, p)
+    }
+    if elem_kind == 1 {
+        var out = table_new_f64()
+        var i: i64 = 0
+        while i < n {
+            var (v, np) = decode_f64(t, p)
+            if np < 0 {
+                return (out, -1)
+            }
+            table_push(out, v)
+            p = np
+            i = i + 1
+        }
+        return (out, p)
+    }
+    if elem_kind == 2 {
+        var out = table_new_string()
+        var i: i64 = 0
+        while i < n {
+            var (v, np) = decode_string(t, p)
+            if np < 0 {
+                return (out, -1)
+            }
+            table_push(out, v)
+            p = np
+            i = i + 1
+        }
+        return (out, p)
+    }
+    return (table_new_i64(), -1)
+}
+
+// decode_map：map → (键表, i64/f64 承载值表, 新位置)。val_kind 同上（1=f64 走
+// 独立 f64 值表）。string 值 map 请用 encode_map_string + 逐对 decode_string。
+pub func decode_map(t: table<i64>, pos: i64, val_kind: i64) -> (table, table, i64) {
+    var (n, dp) = map_tag(t, pos)
+    if n < 0 {
+        return (table_new_string(), table_new_i64(), -1)
+    }
+    var keys = table_new_string()
+    var vals = table_new_i64()
+    var fvals = table_new_f64()
+    var p: i64 = dp
+    var i: i64 = 0
+    while i < n {
+        var (k, np) = decode_string(t, p)
+        if np < 0 {
+            return (keys, vals, -1)
+        }
+        table_push(keys, k)
+        p = np
+        if val_kind == 0 || val_kind == 3 || val_kind == 8 {
+            var v: i64 = 0
+            if val_kind == 0 {
+                var (a, np2) = decode_i64(t, p)
+                if np2 < 0 {
+                    return (keys, vals, -1)
+                }
+                v = a
+                p = np2
+            } else if val_kind == 3 {
+                var (a, np2) = decode_bool(t, p)
+                if np2 < 0 {
+                    return (keys, vals, -1)
+                }
+                v = a
+                p = np2
+            } else {
+                var (a, np2) = decode_trit(t, p)
+                if np2 < 0 {
+                    return (keys, vals, -1)
+                }
+                v = a
+                p = np2
+            }
+            table_push(vals, v)
+        } else if val_kind == 1 {
+            var (fv, np2) = decode_f64(t, p)
+            if np2 < 0 {
+                return (keys, fvals, -1)
+            }
+            table_push(fvals, fv)
+            p = np2
+        } else {
+            return (keys, vals, -1)
+        }
+        i = i + 1
+    }
+    if val_kind == 1 {
+        return (keys, fvals, p)
+    }
+    return (keys, vals, p)
+}
+
+// ---------- 文件接口（TIEDBZD 魔数头） ----------
+
+// save：魔数("TIEDBZD"+版本1) + 字节表 → 文件。成功 true。
+pub func save(path: string, bytes: table<i64>) -> bool {
+    var head = table_new_i64()
+    table_push(head, 0x54)
+    table_push(head, 0x49)
+    table_push(head, 0x45)
+    table_push(head, 0x44)
+    table_push(head, 0x42)
+    table_push(head, 0x5A)
+    table_push(head, 0x44)
+    table_push(head, 0x01)
+    return byte_write(path, concat(head, bytes))
+}
+
+// load：读文件 → 校验魔数 → 返回去头字节表。非 zd 文件返回空表。
+pub func load(path: string) -> table<i64> {
+    var data = byte_read(path)
+    if !is_zd(data) {
+        return table_new_i64()
+    }
+    return slice(data, 8, len(data))
+}
+
+// is_zd：TIEDBZD 魔数校验（长度 ≥8 且前 8 字节匹配）。
+pub func is_zd(t: table<i64>) -> bool {
+    if len(t) < 8 {
+        return false
+    }
+    if t[0] != 0x54 {
+        return false
+    }
+    if t[1] != 0x49 {
+        return false
+    }
+    if t[2] != 0x45 {
+        return false
+    }
+    if t[3] != 0x44 {
+        return false
+    }
+    if t[4] != 0x42 {
+        return false
+    }
+    if t[5] != 0x5A {
+        return false
+    }
+    if t[6] != 0x44 {
+        return false
+    }
+    return t[7] == 0x01
+}
+}

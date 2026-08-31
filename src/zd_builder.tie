@@ -175,6 +175,37 @@ func b_append_array_head(buf: ref table<i64>, n: i64) {
     b_append_be32(buf, n)
 }
 
+// b_append_f64：0xCB + 8 字节位模式直写构建器（M1 bitcast 原语接入，
+// 取代 zd.write_f64_be 的数学分解快路径；同宽 64 位直读）。
+pub func b_append_f64(buf: ref table<i64>, x: f64) {
+    table_push(buf, 0xCB)
+    var bits = bitcast_f64_i64(x)
+    var i: i64 = 7
+    while i >= 0 {
+        table_push(buf, (bits >> (i * 8)) & 0xFF)
+        i = i - 1
+    }
+}
+
+// decode_f64_fast：0xCB + 8 字节位模式 → f64（M1 bitcast 原语接入，
+// 取代 zd.read_f64_be 的数学分解快路径）。失败 (0.0, -1)。
+pub func decode_f64_fast(t: table<i64>, pos: i64) -> (f64, i64) {
+    if zd.u8_at(t, pos) != 0xCB {
+        return (0.0, -1)
+    }
+    var bits: i64 = 0
+    var i: i64 = 0
+    while i < 8 {
+        var b = zd.u8_at(t, pos + 1 + i)
+        if b < 0 {
+            return (0.0, -1)
+        }
+        bits = (bits << 8) | b
+        i = i + 1
+    }
+    return (bitcast_i64_f64(bits), pos + 9)
+}
+
 // ---------- 批量编解码 ----------
 
 // encode_string_array_batch：构建器一次性写入 fixarray 头 + 各字符串。
@@ -203,15 +234,15 @@ pub func encode_i64_array_batch(vals: table<i64>) -> table<i64> {
     return b_build(buf)
 }
 
-// encode_f64_array_batch：构建器一次性写入 fixarray 头 + 各 f64（0xCB + 8 字节位模式）。
+// encode_f64_array_batch：构建器一次性写入 fixarray 头 + 各 f64（0xCB + 8 字节位模式，
+// bitcast 直写）。
 pub func encode_f64_array_batch(vals: table<f64>) -> table<i64> {
     var buf = new_builder()
     b_append_array_head(buf, len(vals))
     var n: i64 = len(vals)
     var i: i64 = 0
     while i < n {
-        table_push(buf, 0xCB)
-        b_append_bytes(buf, zd.write_f64_be(vals[i]))
+        b_append_f64(buf, vals[i])
         i = i + 1
     }
     return b_build(buf)

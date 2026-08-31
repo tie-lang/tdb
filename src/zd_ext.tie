@@ -123,4 +123,149 @@ pub func save_with_flags(path: string, bytes: table<i64>, flags: i64) -> bool {
     return byte_write(path, zd.concat(make_header(flags), bytes))
 }
 
+// ---------- schema 段（字段名 + 类型数组的容器段，自描述） ----------
+
+// 格式：fixmap(2)：{"names": [string...], "types": [i64...]}。
+//   字段名编码为字符串数组、类型号编码为 i64 数组（类型号约定由调用方 schema 定义，
+//   如 0=i64 1=f64 2=string 3=bool 8=trit）。任意语言可据 names+tys 反序列化到对象。
+pub func encode_schema(names: table<string>, tys: table<i64>) -> table<i64> {
+    var body = table_new_i64()
+    body = zd.concat(body, zd.encode_string("names"))
+    body = zd.concat(body, zd.encode_string_array(names))
+    body = zd.concat(body, zd.encode_string("types"))
+    body = zd.concat(body, zd.encode_i64_array(tys))
+    var head = table_new_i64()
+    table_push(head, 0x82)   // fixmap 2 条目
+    return zd.concat(head, body)
+}
+
+// read_string_array / read_i64_array：内部数组解码（规避 decode_table 泛型返回的
+// 类型问题；对元素类型严格按 string / i64 处理）。
+func read_string_array(t: table<i64>, pos: i64) -> (table<string>, i64) {
+    var out = table_new_string()
+    var (n, dp) = zd.array_tag(t, pos)
+    if n < 0 {
+        return (out, -1)
+    }
+    var p: i64 = dp
+    var i: i64 = 0
+    while i < n {
+        var (s, np) = zd.decode_string(t, p)
+        if np < 0 {
+            return (out, -1)
+        }
+        table_push(out, s)
+        p = np
+        i = i + 1
+    }
+    return (out, p)
+}
+
+func read_i64_array(t: table<i64>, pos: i64) -> (table<i64>, i64) {
+    var out = table_new_i64()
+    var (n, dp) = zd.array_tag(t, pos)
+    if n < 0 {
+        return (out, -1)
+    }
+    var p: i64 = dp
+    var i: i64 = 0
+    while i < n {
+        var (v, np) = zd.decode_i64(t, p)
+        if np < 0 {
+            return (out, -1)
+        }
+        table_push(out, v)
+        p = np
+        i = i + 1
+    }
+    return (out, p)
+}
+
+// decode_schema：→ (names, tys, next)。格式不符 → (空表, 空表, -1)。
+//   next = schema 段整体终点（容器自定界），调用方可直接续读数据段。
+pub func decode_schema(t: table<i64>, pos: i64) -> (table<string>, table<i64>, i64) {
+    var en = table_new_string()
+    var et = table_new_i64()
+    var (n, dp) = zd.map_tag(t, pos)
+    if n != 2 {
+        return (en, et, -1)
+    }
+    var names = table_new_string()
+    var tys = table_new_i64()
+    var got_names: bool = false
+    var got_types: bool = false
+    var p: i64 = dp
+    var i: i64 = 0
+    while i < n {
+        var (k, p2) = zd.decode_string(t, p)
+        if p2 < 0 {
+            return (en, et, -1)
+        }
+        p = p2
+        if k == "names" {
+            var (na, p3) = read_string_array(t, p)
+            if p3 < 0 {
+                return (en, et, -1)
+            }
+            names = na
+            p = p3
+            got_names = true
+        } else if k == "types" {
+            var (ty, p3) = read_i64_array(t, p)
+            if p3 < 0 {
+                return (en, et, -1)
+            }
+            tys = ty
+            p = p3
+            got_types = true
+        } else {
+            return (en, et, -1)
+        }
+        i = i + 1
+    }
+    if !got_names || !got_types {
+        return (en, et, -1)
+    }
+    return (names, tys, p)
+}
+
+// encode_with_schema：schema 段 + 数据段组装（schema 段自定界，next 即数据段起点）。
+pub func encode_with_schema(body: table<i64>, names: table<string>, tys: table<i64>) -> table<i64> {
+    return zd.concat(encode_schema(names, tys), body)
+}
+
+// ---------- 内容哈希段（FNV-1a 64 位完整性） ----------
+
+// content_hash：FNV-1a 64（内联实现）。偏移量 14695981039346656037
+//   （= 0xcbf29ce484222325，二补码 i64 = -3750763034362895579）、
+//   素数 1099511628211（= 0x100000001b3）。tie i64 乘法按 mod 2^64 回绕，
+//   逐字节 hash = (hash ^ byte) * prime 即得标准 FNV-1a 64 结果。
+pub func content_hash(bytes: table<i64>) -> i64 {
+    var h: i64 = -3750763034362895579
+    var n: i64 = len(bytes)
+    var i: i64 = 0
+    while i < n {
+        h = h ^ (bytes[i] & 0xFF)
+        h = h * 1099511628211
+        i = i + 1
+    }
+    return h
+}
+
+// encode_with_hash：数据段后附加 8 字节大端 FNV-1a 64 内容哈希。
+pub func encode_with_hash(body: table<i64>) -> table<i64> {
+    return zd.concat(body, zd.write_u64_be(content_hash(body)))
+}
+
+// decode_hash_end：→ (hash, body_end)。取末 8 字节大端哈希；body_end = len - 8
+//   （数据段边界）。长度不足 8 → (0, -1)。
+pub func decode_hash_end(t: table<i64>) -> (i64, i64) {
+    var n: i64 = len(t)
+    if n < 8 {
+        return (0, -1)
+    }
+    var (h, np) = zd.read_u64_be(t, n - 8)
+    return (h, n - 8)
+}
+
 }

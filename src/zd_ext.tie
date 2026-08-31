@@ -1,0 +1,126 @@
+type tie<class>
+// tiedb/src/zd_ext.tie —— zd v2 扩展能力 + 自描述/完整性里程碑（M5 + M6）
+// ============================================================================
+// 设计基准 docs/superpowers/specs/2026-08-31-zd-v2-design.md §3/§6：
+//   - null/optional 核心类型（0xc0）：区分「缺失」与「空值」；注意 0xc0 ≠ fixint
+//     0x00（后者是整数值 0）；
+//   - ext 扩展类型（0xd7 + 类型标记 varint + 长度 varint + 载荷）：tie 特有 char/
+//     trit 与 code（tie-IR）载荷走此子类型；未知 ext 类型可整体跳过；
+//   - flags 字节处理（bit0 字典 / bit1 列式 / bit2 ext / bit3 流式 / bit4 压缩）；
+//   - schema 段（字段名 + 类型数组的容器段，供任意语言反序列化到对象）；
+//   - 内容哈希段（FNV-1a 64 位，数据段后附加 8 字节大端哈希，读端完整性校验）。
+// 复用 ../src/zd.tie 基础原语（字节一律 table<i64>，错误哨兵 -1）。
+
+import "../src/zd.tie"
+
+namespace zd_ext {
+
+// ---------- null / optional（0xc0） ----------
+
+// encode_null：空值 → 单字节 [0xC0]。
+pub func encode_null() -> table<i64> {
+    var out = table_new_i64()
+    table_push(out, 0xC0)
+    return out
+}
+
+// decode_null：校验 pos 处字节是否为 0xC0。
+//   是 → (true, pos+1)；否 → (false, pos)（不消费字节，便于 optional 继续解码）。
+pub func decode_null(t: table<i64>, pos: i64) -> (bool, i64) {
+    if zd.u8_at(t, pos) == 0xC0 {
+        return (true, pos + 1)
+    }
+    return (false, pos)
+}
+
+// encode_optional_i64：可选 i64。has=true → encode_i64(value)；has=false → 0xC0（缺失）。
+pub func encode_optional_i64(value: i64, has: bool) -> table<i64> {
+    if has {
+        return zd.encode_i64(value)
+    }
+    return encode_null()
+}
+
+// decode_optional_i64：→ (present, value, next)。
+//   0xC0（缺失/null）→ (false, 0, pos+1)；正常 i64 → (true, value, next)；
+//   0x00（fixint 0，整数值 0）→ (true, 0, pos+1)，与「缺失」严格区分。
+pub func decode_optional_i64(t: table<i64>, pos: i64) -> (bool, i64, i64) {
+    var (is_null, p2) = decode_null(t, pos)
+    if is_null {
+        return (false, 0, p2)
+    }
+    var (v, p3) = zd.decode_i64(t, pos)
+    if p3 < 0 {
+        return (false, 0, -1)
+    }
+    return (true, v, p3)
+}
+
+// ---------- ext 扩展类型（0xd7 + tag varint + len varint + payload） ----------
+
+// ext 子类型标记约定（tie 特有载荷，对齐设计文档 §3/§6）：
+//   tag 1 = char（载荷 = UTF-8 字节）；tag 2 = trit（载荷 = 1 字节 i8 值）；
+//   tag 3 = code（tie-IR，载荷 = TIEIR 7 段格式字节）。
+pub func encode_ext(tag: i64, payload: table<i64>) -> table<i64> {
+    var out = table_new_i64()
+    table_push(out, 0xD7)
+    out = zd.concat(out, zd.write_varint(tag))
+    out = zd.concat(out, zd.write_varint(len(payload)))
+    return zd.concat(out, payload)
+}
+
+// decode_ext：→ (tag, payload, next)。非 0xD7 → (tag=-1, 空表, next=-1)。
+//   未知 ext 类型无需解析载荷：next 即 ext 整体占用区间的 end，调用方可直接跳过。
+pub func decode_ext(t: table<i64>, pos: i64) -> (i64, table<i64>, i64) {
+    if zd.u8_at(t, pos) != 0xD7 {
+        return (-1, table_new_i64(), -1)
+    }
+    var (tag, p2) = zd.read_varint(t, pos + 1)
+    if p2 < 0 {
+        return (-1, table_new_i64(), -1)
+    }
+    var (ln, p3) = zd.read_varint(t, p2)
+    if p3 < 0 {
+        return (-1, table_new_i64(), -1)
+    }
+    var n: i64 = len(t)
+    if p3 + ln > n {
+        return (-1, table_new_i64(), -1)
+    }
+    return (tag, zd.slice(t, p3, p3 + ln), p3 + ln)
+}
+
+// ---------- flags 字节处理（bit2 = ext） ----------
+
+// set_flag：置位。flags | (1 << bit)。
+pub func set_flag(flags: i64, bit: i64) -> i64 {
+    return flags | (1 << bit)
+}
+
+// has_flag：查询位是否置位。
+pub func has_flag(flags: i64, bit: i64) -> bool {
+    return (flags & (1 << bit)) != 0
+}
+
+// make_header：构造 v2 完整文件头（魔数 + "02" 版本 + flags），供 save 时写 flags。
+pub func make_header(flags: i64) -> table<i64> {
+    var h = table_new_i64()
+    table_push(h, 0x54)
+    table_push(h, 0x49)
+    table_push(h, 0x45)
+    table_push(h, 0x44)
+    table_push(h, 0x42)
+    table_push(h, 0x5A)
+    table_push(h, 0x44)
+    table_push(h, 0x00)   // d1 = 0
+    table_push(h, 0x02)   // d2 = 2 → version = 0*48 + 2 = 2
+    table_push(h, flags)  // flags 字节
+    return h
+}
+
+// save_with_flags：以指定 flags 写 v2 文件（完整文件头 + 字节表）。成功 true。
+pub func save_with_flags(path: string, bytes: table<i64>, flags: i64) -> bool {
+    return byte_write(path, zd.concat(make_header(flags), bytes))
+}
+
+}

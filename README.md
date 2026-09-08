@@ -55,4 +55,4 @@ clang bin/main.ll -o bin/tiedb.exe \
 
 ## License
 
-TIE-LANG Open Source License v1.1. See [LICENSE](LICENSE).
+Tie Public License v1.2 (TPL 1.2). See [LICENSE](LICENSE).

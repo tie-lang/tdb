@@ -1,0 +1,1217 @@
+type tie<class>
+// tiedb/src/tdata.tie —— tie:data 解析与写出核心（namespace td）
+// ============================================================================
+// 格式契约：docs/language.md §2 与 compiler/config.tie 权威行为。
+//   可选头 type tie<data>；单一根值；表/数组共用 [...]（首条目 "k": v 即表，
+//   空 [] 为数组）；逗号可选容忍尾逗号；// 注释；官方六转义 + \0 \b \f \uXXXX；
+//   整数窄后缀 i8..u128 / 浮点 f32 f64 与指数以字面量原文保真；trit zero；char。
+// 输出：表键 strcmp 序（=码点序）默认；pretty=4 空格+尾逗号。墓碑删除协议：
+//   子节点类型置 0 哨兵，遍历与写出跳过（物理压缩后置）。
+
+var g_trace: bool = false;
+
+// ---------- 节点存储与状态（文件级全局） ----------
+
+var g_ty: table<i64>;      // 0=墓碑 1=bool 2=int 3=float 4=str 5=array 6=map 7=trit 8=char
+var g_iv: table<i64>;
+var g_txt: table<string>;
+var g_start: table<i64>;
+var g_cnt: table<i64>;
+var g_ch: table<i64>;
+var g_key: table<string>;
+
+var g_src: string = "";
+var g_p: i64 = 0;
+var g_line: i64 = 1;
+var g_col: i64 = 1;
+var g_has_header: bool = false;
+
+var o_pretty: bool = true;
+var o_indent: string = "    ";
+var o_trailing: bool = true;
+var o_insertion: bool = false;
+var o_compact_scalars: bool = false;
+var o_header: bool = false;
+
+var e_msg: string = "";
+var e_line: i64 = 0;
+var e_col: i64 = 0;
+
+namespace td {
+
+
+pub func set_trace(v: bool) {
+    g_trace = v
+}
+
+func tr(msg: string) {
+    if g_trace {
+        print_err(msg)
+    }
+}
+
+// ---------- 选项 setter ----------
+
+pub func set_pretty(v: bool) {
+    o_pretty = v
+}
+
+pub func set_indent(s: string) {
+    o_indent = s
+}
+
+pub func set_trailing(v: bool) {
+    o_trailing = v
+}
+
+pub func set_insertion(v: bool) {
+    o_insertion = v
+}
+
+pub func set_compact_scalars(v: bool) {
+    o_compact_scalars = v
+}
+
+pub func set_header(v: bool) {
+    o_header = v
+}
+
+// ---------- 诊断 ----------
+
+pub func last_error() -> string {
+    if e_line <= 0 {
+        return e_msg
+    }
+    var sb = string_builder()
+    sb_append(sb, "第 ")
+    sb_append(sb, to_string(e_line))
+    sb_append(sb, " 行，第 ")
+    sb_append(sb, to_string(e_col))
+    sb_append(sb, " 列: ")
+    sb_append(sb, e_msg)
+    return sb_build(sb)
+}
+
+func fail(msg: string) -> i64 {
+    e_msg = msg
+    e_line = g_line
+    e_col = g_col
+    return -1
+}
+
+// ---------- 访问器 ----------
+
+pub func ty(id: i64) -> i64 {
+    return g_ty[id]
+}
+
+pub func iv(id: i64) -> i64 {
+    return g_iv[id]
+}
+
+pub func txt(id: i64) -> string {
+    return g_txt[id]
+}
+
+pub func cnt(id: i64) -> i64 {
+    return g_cnt[id]
+}
+
+pub func key_at(id: i64, k: i64) -> string {
+    return g_key[g_start[id] + k]
+}
+
+pub func ch_at(id: i64, k: i64) -> i64 {
+    return g_ch[g_start[id] + k]
+}
+
+pub func has_header() -> bool {
+    return g_has_header
+}
+
+// ---------- 构造器 ----------
+
+func nd(ty_code: i64, iv_val: i64, txt_val: string) -> i64 {
+    var id: i64 = len(g_ty)
+    if g_trace {
+        print_err("nd " + to_string(id) + " ty=" + to_string(ty_code))
+    }
+    table_push(g_ty, ty_code)
+    table_push(g_iv, iv_val)
+    table_push(g_txt, txt_val)
+    table_push(g_start, 0)
+    table_push(g_cnt, 0)
+    return id
+}
+
+pub func new_bool(v: bool) -> i64 {
+    if v {
+        return nd(1, 1, "")
+    }
+    return nd(1, 0, "")
+}
+
+pub func new_int_text(raw: string) -> i64 {
+    return nd(2, 0, raw)
+}
+
+pub func new_float_text(raw: string) -> i64 {
+    return nd(3, 0, raw)
+}
+
+pub func new_str(s: string) -> i64 {
+    return nd(4, 0, s)
+}
+
+pub func new_trit(v: i64) -> i64 {
+    return nd(7, v, "")
+}
+
+pub func new_char(cp: i64) -> i64 {
+    return nd(8, cp, "")
+}
+
+pub func new_array() -> i64 {
+    return nd(5, 0, "")
+}
+
+pub func new_map() -> i64 {
+    return nd(6, 0, "")
+}
+
+pub func push_child(id: i64, key: string, child: i64) {
+    if g_cnt[id] == 0 {
+        g_start[id] = len(g_ch)
+    }
+    table_push(g_ch, child)
+    if g_ty[id] == 6 {
+        table_push(g_key, key)
+    }
+    g_cnt[id] = g_cnt[id] + 1
+}
+
+// overwrite_child：覆盖容器第 k 个子引用（重复键后值覆盖）。
+func overwrite_child(id: i64, k: i64, child: i64) {
+    g_ch[g_start[id] + k] = child
+}
+
+// ---------- 变更操作 ----------
+
+pub func txt_set(id: i64, s: string) {
+    g_txt[id] = s
+}
+
+pub func replace_child(id: i64, k: i64, child: i64) {
+    g_ch[g_start[id] + k] = child
+}
+
+// remove_child：墓碑删除（类型置 0；写出/遍历跳过；空间不回收）。
+pub func remove_child(id: i64, k: i64) -> bool {
+    if k < 0 || k >= g_cnt[id] {
+        return false
+    }
+    var base: i64 = g_start[id]
+    g_ty[g_ch[base + k]] = 0
+    g_key[base + k] = ""
+    return true
+}
+
+pub func alive_cnt(id: i64) -> i64 {
+    var alive: i64 = 0
+    var k: i64 = 0
+    while k < g_cnt[id] {
+        if g_ty[g_ch[g_start[id] + k]] != 0 {
+            alive = alive + 1
+        }
+        k = k + 1
+    }
+    return alive
+}
+
+pub func clone(id: i64) -> i64 {
+    var t: i64 = g_ty[id]
+    if t == 5 || t == 6 {
+        var copy: i64 = nd(t, 0, "")
+        var k: i64 = 0
+        while k < g_cnt[id] {
+            var base: i64 = g_start[id] + k
+            if g_ty[g_ch[base]] == 0 {
+                k = k + 1
+                continue
+            }
+            if t == 6 {
+                push_child(copy, g_key[base], clone(g_ch[base]))
+            } else {
+                push_child(copy, "", clone(g_ch[base]))
+            }
+            k = k + 1
+        }
+        return copy
+    }
+    return nd(t, g_iv[id], g_txt[id])
+}
+
+// debug_dump：向 stderr 转储节点池全貌（诊断用）。
+pub func debug_dump() {
+    var i: i64 = 0
+    while i < len(g_ty) {
+        var line: string = "nd" + to_string(i) + " ty=" + to_string(g_ty[i]) + " iv=" + to_string(g_iv[i]) + " start=" + to_string(g_start[i]) + " cnt=" + to_string(g_cnt[i])
+        if g_ty[i] == 4 || g_ty[i] == 2 || g_ty[i] == 3 {
+            line = line + " txt=[" + g_txt[i] + "]"
+        }
+        print_err(line)
+        i = i + 1
+    }
+    var k: i64 = 0
+    while k < len(g_ch) {
+        var kk: string = ""
+        if k < len(g_key) {
+            kk = g_key[k]
+        }
+        print_err("ch[" + to_string(k) + "]=" + to_string(g_ch[k]) + " key=[" + kk + "]")
+        k = k + 1
+    }
+}
+
+// ---------- 词法辅助 ----------
+
+func eof() -> bool {
+    return g_p >= str_len(g_src)
+}
+
+func peek() -> string {
+    return str_char(g_src, g_p)
+}
+
+func peek_cp() -> i64 {
+    return char_code(str_char(g_src, g_p))
+}
+
+func advance() {
+    if peek_cp() == 10 {
+        g_line = g_line + 1
+        g_col = 1
+    } else {
+        g_col = g_col + 1
+    }
+    g_p = g_p + 1
+}
+
+func skip_hspace() {
+    while !eof() {
+        var cp: i64 = peek_cp()
+        if cp == 9 || cp == 32 {
+            advance()
+        } else {
+            return
+        }
+    }
+}
+
+func skip_trivia() {
+    while !eof() {
+        var cp: i64 = peek_cp()
+        if cp == 32 || cp == 9 || cp == 10 || cp == 13 {
+            advance()
+        } else if cp == 47 && g_p + 1 < str_len(g_src) && char_code(str_char(g_src, g_p + 1)) == 47 {
+            while !eof() && peek_cp() != 10 {
+                advance()
+            }
+        } else {
+            return
+        }
+    }
+}
+
+func match_word(word: string) -> bool {
+    var n: i64 = str_len(word)
+    if g_p + n > str_len(g_src) {
+        return false
+    }
+    var i: i64 = 0
+    while i < n {
+        if str_char(g_src, g_p + i) != str_char(word, i) {
+            return false
+        }
+        i = i + 1
+    }
+    var after: i64 = g_p + n
+    if after < str_len(g_src) {
+        var c: i64 = char_code(str_char(g_src, after))
+        if is_letter_cp(c) || is_digit_c(str_char(g_src, after)) {
+            return false
+        }
+    }
+    var k: i64 = 0
+    while k < n {
+        advance()
+        k = k + 1
+    }
+    return true
+}
+
+func sub_str(s: string, start: i64, n: i64) -> string {
+    var sb = string_builder()
+    var i: i64 = 0
+    while i < n {
+        sb_append(sb, str_char(s, start + i))
+        i = i + 1
+    }
+    return sb_build(sb)
+}
+
+func hex_val(c: string) -> i64 {
+    var cp: i64 = char_code(c)
+    if cp >= 48 && cp <= 57 {
+        return cp - 48
+    }
+    if cp >= 97 && cp <= 102 {
+        return cp - 87
+    }
+    if cp >= 65 && cp <= 70 {
+        return cp - 55
+    }
+    return -1
+}
+
+func is_digit_c(c: string) -> bool {
+    var cp: i64 = char_code(c)
+    return cp >= 48 && cp <= 57
+}
+
+func is_letter_cp(cp: i64) -> bool {
+    return (cp >= 97 && cp <= 122) || (cp >= 65 && cp <= 90) || cp == 95
+}
+
+func printable(c: string) -> string {
+    var cp: i64 = char_code(c)
+    if cp >= 32 && cp < 127 {
+        return c
+    }
+    var digits: string = "0123456789ABCDEF"
+    var sb = string_builder()
+    sb_append(sb, "U+")
+    var shift: i64 = 16
+    while shift >= 0 {
+        sb_append(sb, str_char(digits, (cp >> shift) & 15))
+        shift = shift - 4
+    }
+    return sb_build(sb)
+}
+
+// ---------- 头部识别 ----------
+
+func parse_header(required: bool) -> i64 {
+    var sp: i64 = g_p
+    var sl: i64 = g_line
+    var sc: i64 = g_col
+    skip_trivia()
+    if match_word("type") {
+        skip_hspace()
+        if !match_word("tie") {
+            return fail("头部声明应为 type tie<角色>")
+        }
+        skip_hspace()
+        if !eof() && peek() == "<" {
+            advance()
+            skip_hspace()
+            var s: i64 = g_p
+            while !eof() && is_letter_cp(peek_cp()) {
+                advance()
+            }
+            var role: string = sub_str(g_src, s, g_p - s)
+            skip_hspace()
+            if eof() || peek() != ">" {
+                return fail("头部声明缺少 '>'")
+            }
+            advance()
+            if role != "data" {
+                return fail("文件角色为 tie<" + role + ">，不是 tie<data> 数据文档")
+            }
+            g_has_header = true
+            return 0
+        }
+        return fail("头部声明缺少角色标注（应为 type tie<data>）")
+    }
+    g_p = sp
+    g_line = sl
+    g_col = sc
+    if required {
+        return fail("缺少 type tie<data> 头部声明")
+    }
+    return 0
+}
+
+// ---------- 字符串 ----------
+
+func append_escape(sb: i64) -> i64 {
+    advance()
+    if eof() {
+        return fail("转义序列不完整")
+    }
+    var e: string = peek()
+    if e == "\"" {
+        sb_append(sb, "\"")
+    } else if e == "\\" {
+        sb_append(sb, "\\")
+    } else if e == "/" {
+        sb_append(sb, "/")
+    } else if e == "n" {
+        sb_append(sb, "\n")
+    } else if e == "r" {
+        sb_append(sb, "\r")
+    } else if e == "t" {
+        sb_append(sb, "\t")
+    } else if e == "0" {
+        sb_append_byte(sb, 0)
+    } else if e == "b" {
+        sb_append_byte(sb, 8)
+    } else if e == "f" {
+        sb_append_byte(sb, 12)
+    } else if e == "u" {
+        advance()
+        var cp: i64 = 0
+        var k: i64 = 0
+        while k < 4 {
+            if eof() {
+                return fail("\\u 转义不完整")
+            }
+            var hv: i64 = hex_val(peek())
+            if hv < 0 {
+                return fail("\\u 含非十六进制字符")
+            }
+            cp = cp * 16 + hv
+            advance()
+            k = k + 1
+        }
+        sb_append(sb, str_from_code(cp))
+        return 0
+    } else {
+        return fail("未知转义 \\" + e)
+    }
+    advance()
+    return 0
+}
+
+func parse_string() -> (i64, i64) {
+    if peek() != "\"" {
+        return (-1, fail("字符串应以双引号开始"))
+    }
+    advance()
+    var sb = string_builder()
+    while true {
+        if eof() {
+            return (-1, fail("字符串未闭合"))
+        }
+        var c: string = peek()
+        if c == "\"" {
+            advance()
+            return (new_str(sb_build(sb)), 0)
+        }
+        if c == "\\" {
+            var r: i64 = append_escape(sb)
+            if r < 0 {
+                return (-1, r)
+            }
+            continue
+        }
+        if peek_cp() == 10 {
+            return (-1, fail("字符串中不允许裸换行（请用 \\n 转义）"))
+        }
+        sb_append(sb, c)
+        advance()
+    }
+    return (-1, 0)
+}
+
+// decode_single：恰为一个码点（含代理对合并）时返回码点值，否则 -1。
+func decode_single(s: string) -> i64 {
+    var n: i64 = str_len(s)
+    if n == 1 {
+        return char_code(str_char(s, 0))
+    }
+    if n == 2 {
+        var hi: i64 = char_code(str_char(s, 0))
+        var lo: i64 = char_code(str_char(s, 1))
+        if hi >= 55296 && hi <= 56319 && lo >= 56320 && lo <= 57343 {
+            return 65536 + ((hi - 55296) << 10) + (lo - 56320)
+        }
+    }
+    return -1
+}
+
+func parse_char_lit() -> (i64, i64) {
+    advance()
+    if eof() {
+        return (-1, fail("char 字面量未闭合"))
+    }
+    var cp: i64 = -1
+    if peek() == "\\" {
+        var sb = string_builder()
+        var r: i64 = append_escape(sb)
+        if r < 0 {
+            return (-1, r)
+        }
+        cp = decode_single(sb_build(sb))
+        if cp < 0 {
+            return (-1, fail("char 字面量必须恰好一个码点"))
+        }
+    } else {
+        if peek() == "'" {
+            return (-1, fail("char 字面量为空"))
+        }
+        var cc: i64 = peek_cp()
+        advance()
+        cp = cc
+        if cc >= 55296 && cc <= 56319 && !eof() {
+            var lo: i64 = peek_cp()
+            if lo >= 56320 && lo <= 57343 {
+                advance()
+                cp = 65536 + ((cc - 55296) << 10) + (lo - 56320)
+            }
+        }
+    }
+    if eof() || peek() != "'" {
+        return (-1, fail("char 字面量必须恰好一个码点并以单引号闭合"))
+    }
+    advance()
+    return (new_char(cp), 0)
+}
+
+// ---------- 数字 ----------
+
+func parse_number() -> (i64, i64) {
+    var start: i64 = g_p
+    if peek() == "-" {
+        advance()
+    }
+    var any_int: bool = false
+    while !eof() && is_digit_c(peek()) {
+        any_int = true
+        advance()
+    }
+    if !any_int {
+        return (-1, fail("数字缺少整数部分"))
+    }
+    var is_float: bool = false
+    if !eof() && peek() == "." {
+        advance()
+        var frac: bool = false
+        while !eof() && is_digit_c(peek()) {
+            frac = true
+            advance()
+        }
+        if !frac {
+            return (-1, fail("数字小数部分缺少数字"))
+        }
+        is_float = true
+    }
+    if !eof() && (peek() == "e" || peek() == "E") {
+        advance()
+        if !eof() && (peek() == "+" || peek() == "-") {
+            advance()
+        }
+        var exp: bool = false
+        while !eof() && is_digit_c(peek()) {
+            exp = true
+            advance()
+        }
+        if !exp {
+            return (-1, fail("指数部分缺少数字"))
+        }
+        is_float = true
+    }
+    var suffix: string = ""
+    if !eof() && is_letter_cp(peek_cp()) {
+        var ss: i64 = g_p
+        while !eof() && (is_letter_cp(peek_cp()) || is_digit_c(peek())) {
+            advance()
+        }
+        suffix = sub_str(g_src, ss, g_p - ss)
+    }
+    var raw: string = sub_str(g_src, start, g_p - start)
+    var numeric: string = raw
+    if str_len(suffix) > 0 {
+        numeric = sub_str(raw, 0, str_len(raw) - str_len(suffix))
+    }
+    if !valid_suffix(suffix, is_float) {
+        return (-1, fail("无效的数字后缀 \"" + suffix + "\""))
+    }
+    if is_float {
+        return (new_float_text(numeric), 0)
+    }
+    return (new_int_text(numeric), 0)
+}
+
+func valid_suffix(suffix: string, is_float: bool) -> bool {
+    var n: i64 = str_len(suffix)
+    if n == 0 {
+        return true
+    }
+    if is_float {
+        if suffix == "f32" || suffix == "f64" {
+            return true
+        }
+        return false
+    }
+    if suffix == "i8" || suffix == "i16" || suffix == "i32" || suffix == "i64" {
+        return true
+    }
+    if suffix == "i128" || suffix == "u8" || suffix == "u16" || suffix == "u32" {
+        return true
+    }
+    return suffix == "u64" || suffix == "u128"
+}
+
+// ---------- 关键字 ----------
+
+func parse_keyword() -> (i64, i64) {
+    var s: i64 = g_p
+    while !eof() && (is_letter_cp(peek_cp()) || is_digit_c(peek())) {
+        advance()
+    }
+    var word: string = sub_str(g_src, s, g_p - s)
+    if word == "true" {
+        return (new_bool(true), 0)
+    }
+    if word == "false" {
+        return (new_bool(false), 0)
+    }
+    if word == "zero" {
+        return (new_trit(0), 0)
+    }
+    return (-1, fail("无法识别的字面量 \"" + word + "\"（tie:data 标量关键字只有 true/false/zero）"))
+}
+
+// ---------- 容器 ----------
+
+func parse_container(depth: i64) -> (i64, i64) {
+    advance()
+    if depth > 256 {
+        return (-1, fail("嵌套过深（超过 256 层）"))
+    }
+    skip_trivia()
+    if eof() {
+        return (-1, fail("容器未闭合（缺少 ']'）"))
+    }
+    if peek() == "]" {
+        advance()
+        return (new_array(), 0)
+    }
+    if peek() == "\"" && looks_like_table_entry() {
+        return parse_table_body(depth + 1)
+    }
+    return parse_array_body(depth + 1)
+}
+
+func looks_like_table_entry() -> bool {
+    var sp: i64 = g_p
+    var sl: i64 = g_line
+    var sc: i64 = g_col
+    var (sid, sr) = parse_string()
+    skip_trivia()
+    var ok: bool = sr == 0 && !eof() && peek() == ":"
+    g_p = sp
+    g_line = sl
+    g_col = sc
+    return ok
+}
+
+func parse_table_body(depth: i64) -> (i64, i64) {
+    var tmp_keys = table_new_string()
+    var tmp_vals = table_new_i64()
+    while true {
+        skip_trivia()
+        if eof() {
+            return (-1, fail("表未闭合（缺少 ']'）"))
+        }
+        if peek() == "]" {
+            advance()
+            tr("tbl-fin start=" + to_string(len(g_ch)) + " n=" + to_string(len(tmp_keys)))
+            var mid: i64 = nd(6, 0, "")
+            g_start[mid] = len(g_ch)
+            g_cnt[mid] = len(tmp_keys)
+            var k: i64 = 0
+            while k < len(tmp_keys) {
+                table_push(g_key, tmp_keys[k])
+                table_push(g_ch, tmp_vals[k])
+                k = k + 1
+            }
+            return (mid, 0)
+        }
+        if peek() != "\"" {
+            return (-1, fail("表条目必须以 \"key\": 形式开始"))
+        }
+        var (key_node, kr) = parse_string()
+        if kr < 0 {
+            return (-1, kr)
+        }
+        var key: string = g_txt[key_node]
+        skip_trivia()
+        if eof() || peek() != ":" {
+            return (-1, fail("键 \"" + key + "\" 后缺少冒号"))
+        }
+        advance()
+        var (value, vr) = parse_value(depth + 1)
+        if vr < 0 {
+            return (-1, vr)
+        }
+        var dup: i64 = -1
+        var kk: i64 = 0
+        while kk < len(tmp_keys) {
+            if tmp_keys[kk] == key {
+                dup = kk
+            }
+            kk = kk + 1
+        }
+        if dup >= 0 {
+            tmp_vals[dup] = value
+        } else {
+            table_push(tmp_keys, key)
+            table_push(tmp_vals, value)
+        }
+        skip_trivia()
+        if !eof() && peek() == "," {
+            advance()
+        }
+    }
+    return (-1, 0)
+}
+func parse_array_body(depth: i64) -> (i64, i64) {
+    var tmp_vals = table_new_i64()
+    while true {
+        skip_trivia()
+        if eof() {
+            return (-1, fail("数组未闭合（缺少 ']'）"))
+        }
+        if peek() == "]" {
+            advance()
+            tr("arr-fin start=" + to_string(len(g_ch)) + " n=" + to_string(len(tmp_vals)))
+            var mid: i64 = nd(5, 0, "")
+            g_start[mid] = len(g_ch)
+            g_cnt[mid] = len(tmp_vals)
+                table_push(g_key, "")
+            var k: i64 = 0
+            while k < len(tmp_vals) {
+                table_push(g_ch, tmp_vals[k])
+                k = k + 1
+            }
+            return (mid, 0)
+        }
+        var (item, ir) = parse_value(depth + 1)
+        if ir < 0 {
+            return (-1, ir)
+        }
+        table_push(tmp_vals, item)
+        skip_trivia()
+        if !eof() && peek() == "," {
+            advance()
+        }
+    }
+    return (-1, 0)
+}
+
+// ---------- 值分发 ----------
+
+func parse_value(depth: i64) -> (i64, i64) {
+    skip_trivia()
+    if eof() {
+        return (-1, fail("值意外结束"))
+    }
+    if depth > 256 {
+        return (-1, fail("嵌套过深（超过 256 层）"))
+    }
+    var c: string = peek()
+    var cp: i64 = char_code(c)
+    if c == "[" {
+        return parse_container(depth)
+    }
+    if c == "\"" {
+        return parse_string()
+    }
+    if c == "'" {
+        return parse_char_lit()
+    }
+    if c == "-" || (cp >= 48 && cp <= 57) {
+        return parse_number()
+    }
+    if is_letter_cp(cp) {
+        return parse_keyword()
+    }
+    return (-1, fail("意外字符 '" + printable(c) + "'"))
+}
+
+
+// ---------- 文档入口（解析） ----------
+
+func norm_lf(s: string) -> string {
+    var sb = string_builder()
+    var n: i64 = str_len(s)
+    var i: i64 = 0
+    while i < n {
+        var c: string = str_char(s, i)
+        var cp: i64 = char_code(c)
+        if cp == 13 {
+            if i + 1 < n && char_code(str_char(s, i + 1)) == 10 {
+                i = i + 1
+            }
+            sb_append(sb, "\n")
+        } else {
+            sb_append(sb, c)
+        }
+        i = i + 1
+    }
+    return sb_build(sb)
+}
+
+// reset_pool：清空节点池（新文档解析前调用；隔离跨解析状态）。
+pub func reset_pool() {
+    g_ty = table_new_i64()
+    g_iv = table_new_i64()
+    g_txt = table_new_i64()
+    g_start = table_new_i64()
+    g_cnt = table_new_i64()
+    g_ch = table_new_i64()
+    g_key = table_new_i64()
+}
+
+pub func parse(raw: string) -> i64 {
+    reset_pool()
+    g_src = norm_lf(raw)
+    g_p = 0
+    g_line = 1
+    g_col = 1
+    g_has_header = false
+    e_msg = ""
+    e_line = 0
+    e_col = 0
+    var hr: i64 = parse_header(false)
+    if hr < 0 {
+        return -1
+    }
+    skip_trivia()
+    if eof() {
+        return fail("文档为空")
+    }
+    var (root, rr) = parse_value(0)
+    if rr < 0 {
+        return -1
+    }
+    skip_trivia()
+    if !eof() {
+        return fail("文档根值之后有多余内容")
+    }
+    return root
+}
+
+pub func parse_file(path: string) -> i64 {
+    return parse(file_read(path))
+}
+
+// ============================================================
+// 写出器
+// ============================================================
+
+func append_escaped_body(sb: i64, s: string) {
+    var n: i64 = str_len(s)
+    var i: i64 = 0
+    while i < n {
+        var c: string = str_char(s, i)
+        var cp: i64 = char_code(c)
+        if cp == 34 {
+            sb_append(sb, "\\\"")
+        } else if cp == 92 {
+            sb_append(sb, "\\\\")
+        } else if cp == 10 {
+            sb_append(sb, "\\n")
+        } else if cp == 13 {
+            sb_append(sb, "\\r")
+        } else if cp == 9 {
+            sb_append(sb, "\\t")
+        } else if cp < 32 {
+            var digits: string = "0123456789ABCDEF"
+            sb_append(sb, "\\u00")
+            sb_append(sb, str_char(digits, (cp >> 4) & 15))
+            sb_append(sb, str_char(digits, cp & 15))
+        } else {
+            sb_append(sb, c)
+        }
+        i = i + 1
+    }
+}
+
+func append_quoted(sb: i64, s: string) {
+    sb_append(sb, "\"")
+    append_escaped_body(sb, s)
+    sb_append(sb, "\"")
+}
+
+func append_hex4(sb: i64, cp: i64) {
+    var digits: string = "0123456789ABCDEF"
+    sb_append(sb, "\\u")
+    sb_append(sb, str_char(digits, (cp >> 12) & 15))
+    sb_append(sb, str_char(digits, (cp >> 8) & 15))
+    sb_append(sb, str_char(digits, (cp >> 4) & 15))
+    sb_append(sb, str_char(digits, cp & 15))
+}
+
+func append_char_lit(sb: i64, codepoint: i64) {
+    sb_append(sb, "'")
+    if codepoint == 39 {
+        sb_append(sb, "\\'")
+    } else if codepoint == 92 {
+        sb_append(sb, "\\\\")
+    } else if codepoint == 10 {
+        sb_append(sb, "\\n")
+    } else if codepoint == 13 {
+        sb_append(sb, "\\r")
+    } else if codepoint == 9 {
+        sb_append(sb, "\\t")
+    } else if codepoint < 32 {
+        append_hex4(sb, codepoint)
+    } else if codepoint > 65535 {
+        var v: i64 = codepoint - 65536
+        sb_append(sb, str_from_code(55296 + (v >> 10)))
+        sb_append(sb, str_from_code(56320 + (v & 1023)))
+    } else {
+        sb_append(sb, str_from_code(codepoint))
+    }
+    sb_append(sb, "'")
+}
+
+func cmp_keys(a: string, b: string) -> i64 {
+    var na: i64 = str_len(a)
+    var nb: i64 = str_len(b)
+    var n: i64 = na
+    if nb < n {
+        n = nb
+    }
+    var i: i64 = 0
+    while i < n {
+        var ca: i64 = char_code(str_char(a, i))
+        var cb: i64 = char_code(str_char(b, i))
+        if ca != cb {
+            return ca - cb
+        }
+        i = i + 1
+    }
+    return na - nb
+}
+
+func append_indent(sb: i64, depth: i64) {
+    var i: i64 = 0
+    while i < depth {
+        sb_append(sb, o_indent)
+        i = i + 1
+    }
+}
+
+func all_scalars(id: i64) -> bool {
+    var k: i64 = 0
+    while k < g_cnt[id] {
+        var cid: i64 = g_ch[g_start[id] + k]
+        if g_ty[cid] != 0 && (g_ty[cid] == 5 || g_ty[cid] == 6) {
+            return false
+        }
+        k = k + 1
+    }
+    return true
+}
+
+func sorted_order(id: i64) -> table<i64> {
+    var order = table_new_i64()
+    var i: i64 = 0
+    while i < g_cnt[id] {
+        if g_ty[g_ch[g_start[id] + i]] != 0 {
+            table_push(order, i)
+        }
+        i = i + 1
+    }
+    if o_insertion {
+        return order
+    }
+    var m: i64 = len(order)
+    var a: i64 = 0
+    while a < m {
+        var best: i64 = a
+        var b: i64 = a + 1
+        while b < m {
+            if cmp_keys(key_at(id, order[b]), key_at(id, order[best])) < 0 {
+                best = b
+            }
+            b = b + 1
+        }
+        var tmp: i64 = order[a]
+        order[a] = order[best]
+        order[best] = tmp
+        a = a + 1
+    }
+    return order
+}
+
+func write_value(sb: i64, id: i64, depth: i64) {
+    var t: i64 = g_ty[id]
+    if t == 1 {
+        if g_iv[id] == 1 {
+            sb_append(sb, "true")
+        } else {
+            sb_append(sb, "false")
+        }
+        return
+    }
+    if t == 7 {
+        sb_append(sb, "zero")
+        return
+    }
+    if t == 8 {
+        append_char_lit(sb, g_iv[id])
+        return
+    }
+    if t == 4 {
+        append_quoted(sb, g_txt[id])
+        return
+    }
+    if t == 2 || t == 3 {
+        sb_append(sb, g_txt[id])
+        return
+    }
+    if t == 5 {
+        write_array(sb, id, depth)
+        return
+    }
+    write_table(sb, id, depth)
+}
+
+func write_array(sb: i64, id: i64, depth: i64) {
+    var alive: i64 = alive_cnt(id)
+    if alive == 0 {
+        sb_append(sb, "[]")
+        return
+    }
+    if o_pretty && o_compact_scalars && all_scalars(id) {
+        sb_append(sb, "[")
+        var emitted: i64 = 0
+        var k: i64 = 0
+        while k < g_cnt[id] {
+            var cid: i64 = g_ch[g_start[id] + k]
+            if g_ty[cid] == 0 {
+                k = k + 1
+                continue
+            }
+            if emitted > 0 {
+                sb_append(sb, ", ")
+            }
+            write_value(sb, cid, depth + 1)
+            emitted = emitted + 1
+            k = k + 1
+        }
+        sb_append(sb, "]")
+        return
+    }
+    if !o_pretty {
+        sb_append(sb, "[")
+        var seen2: i64 = 0
+        var e2: i64 = 0
+        while e2 < g_cnt[id] {
+            var cid2: i64 = g_ch[g_start[id] + e2]
+            if g_ty[cid2] == 0 {
+                e2 = e2 + 1
+                continue
+            }
+            if seen2 > 0 {
+                sb_append(sb, ", ")
+            }
+            write_value(sb, cid2, depth + 1)
+            seen2 = seen2 + 1
+            if o_trailing && seen2 < alive {
+                sb_append(sb, ",")
+            }
+            e2 = e2 + 1
+        }
+        sb_append(sb, "]")
+        return
+    }
+    sb_append(sb, "[")
+    var i: i64 = 0
+    var seen: i64 = 0
+    while i < g_cnt[id] {
+        var cid: i64 = g_ch[g_start[id] + i]
+        if g_ty[cid] == 0 {
+            i = i + 1
+            continue
+        }
+        sb_append(sb, "\n")
+        append_indent(sb, depth + 1)
+        write_value(sb, cid, depth + 1)
+        seen = seen + 1
+        if seen != alive || o_trailing {
+            sb_append(sb, ",")
+        }
+        i = i + 1
+    }
+    sb_append(sb, "\n")
+    append_indent(sb, depth)
+    sb_append(sb, "]")
+}
+
+func write_table(sb: i64, id: i64, depth: i64) {
+    var order: table<i64> = sorted_order(id)
+    var alive: i64 = len(order)
+    if alive == 0 {
+        sb_append(sb, "[]")
+        return
+    }
+    if !o_pretty {
+        sb_append(sb, "[")
+        var c2: i64 = 0
+        while c2 < alive {
+            if c2 > 0 {
+                sb_append(sb, ", ")
+            }
+            var idx2: i64 = order[c2]
+            append_quoted(sb, key_at(id, idx2))
+            sb_append(sb, ": ")
+            write_value(sb, ch_at(id, idx2), depth + 1)
+            c2 = c2 + 1
+        }
+        if o_trailing {
+            sb_append(sb, ",")
+        }
+        sb_append(sb, "]")
+        return
+    }
+    sb_append(sb, "[")
+    var e: i64 = 0
+    while e < alive {
+        var idx: i64 = order[e]
+        sb_append(sb, "\n")
+        append_indent(sb, depth + 1)
+        append_quoted(sb, key_at(id, idx))
+        sb_append(sb, ": ")
+        write_value(sb, ch_at(id, idx), depth + 1)
+        if e != alive - 1 || o_trailing {
+            sb_append(sb, ",")
+        }
+        e = e + 1
+    }
+    sb_append(sb, "\n")
+    append_indent(sb, depth)
+    sb_append(sb, "]")
+}
+
+// ---------- 文档写出入口 ----------
+
+pub func write(root: i64) -> string {
+    var sb = string_builder()
+    if o_header {
+        sb_append(sb, "type tie<data>\n\n")
+    }
+    write_value(sb, root, 0)
+    sb_append(sb, "\n")
+    return sb_build(sb)
+}
+
+pub func write_file(root: i64, path: string) -> bool {
+    return file_write(path, write(root))
+}
+}

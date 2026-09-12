@@ -1,0 +1,176 @@
+type tie<class>
+// tiedb/src/codec.tie —— td 节点树 ↔ zd 字节 通用互转桥（namespace tdc）
+// ============================================================================
+// 桥接 tdata（文本模型）与 zd（二进制模型）：按 td 类型码递归编码，
+// 按 zd 首标签递归解码。自描述标签使任意嵌套结构无损往返。
+// 注意：整数/浮点经 parse_int/parse_float 与字面量文本互换（i64 域内精确；
+// 超 i64 大数文本有损，限制注明）。本模块无全局状态。
+
+import "./tdata.tie"
+import "./zd.tie"
+
+namespace tdc {
+
+// encode_node：td 节点 → 自描述 zd 字节。
+pub func encode_node(id: i64) -> table<i64> {
+    var t: i64 = td.ty(id)
+    if t == 1 {
+        return zd.encode_bool(td.iv(id) == 1)
+    }
+    if t == 7 {
+        return zd.encode_trit(td.iv(id))
+    }
+    if t == 8 {
+        return zd.encode_char(str_from_code(td.iv(id)))
+    }
+    if t == 4 {
+        return zd.encode_string(td.txt(id))
+    }
+    if t == 2 {
+        return zd.encode_i64(parse_int(td.txt(id)))
+    }
+    if t == 3 {
+        return zd.encode_f64(parse_float(td.txt(id)))
+    }
+    if t == 5 {
+        var body = table_new_i64()
+        var k: i64 = 0
+        while k < td.cnt(id) {
+            body = zd.concat(body, encode_node(td.ch_at(id, k)))
+            k = k + 1
+        }
+        return zd.encode_array(td.cnt(id), body)
+    }
+    if t == 6 {
+        var body2 = table_new_i64()
+        var k2: i64 = 0
+        while k2 < td.cnt(id) {
+            body2 = zd.concat(body2, zd.encode_string(td.key_at(id, k2)))
+            body2 = zd.concat(body2, encode_node(td.ch_at(id, k2)))
+            k2 = k2 + 1
+        }
+        return zd.encode_array(td.cnt(id), body2)
+    }
+    return table_new_i64()
+}
+
+// decode_value：zd 字节 → 新建 td 节点 → (节点 id, 新位置)。首标签分派。
+pub func decode_value(bytes: table<i64>, pos: i64) -> (i64, i64) {
+    var tag: i64 = zd.u8_at(bytes, pos)
+    if tag < 0 {
+        return (-1, -1)
+    }
+    if tag == 0xC2 || tag == 0xC3 {
+        var (bv, np) = zd.decode_bool(bytes, pos)
+        if np < 0 {
+            return (-1, -1)
+        }
+        return (td.new_bool(bv == 1), np)
+    }
+    if tag == 0xC4 {
+        var (cv, np) = zd.decode_char(bytes, pos)
+        if np < 0 {
+            return (-1, -1)
+        }
+        return (td.new_char(char_code(cv)), np)
+    }
+    if tag == 0xC5 {
+        var (tv, np) = zd.decode_trit(bytes, pos)
+        if np < 0 {
+            return (-1, -1)
+        }
+        return (td.new_trit(tv), np)
+    }
+    if (tag >= 0xA0 && tag <= 0xBF) || tag == 0xD9 || tag == 0xDA || tag == 0xDB {
+        var (sv, np) = zd.decode_string(bytes, pos)
+        if np < 0 {
+            return (-1, -1)
+        }
+        return (td.new_str(sv), np)
+    }
+    var int_tag: bool = tag <= 0x7F || tag >= 0xE0 || tag == 0xCC || tag == 0xCD || tag == 0xCE || tag == 0xCF || tag == 0xD0 || tag == 0xD1 || tag == 0xD2 || tag == 0xD3
+    if int_tag {
+        var (iv, np) = zd.decode_i64(bytes, pos)
+        if np < 0 {
+            return (-1, -1)
+        }
+        return (td.new_int_text(to_string(iv)), np)
+    }
+    if tag == 0xCB {
+        var (fv, np) = zd.decode_f64(bytes, pos)
+        if np < 0 {
+            return (-1, -1)
+        }
+        return (td.new_float_text(float_text(fv)), np)
+    }
+    if (tag >= 0x90 && tag <= 0x9F) || tag == 0xDC || tag == 0xDD {
+        return decode_array(bytes, pos)
+    }
+    if (tag >= 0x80 && tag <= 0x8F) || tag == 0xDE || tag == 0xDF {
+        return decode_map(bytes, pos)
+    }
+    return (-1, -1)
+}
+
+// float_text：f64 → 保证浮点语法的文本（整形态补 .0）。
+func float_text(v: f64) -> string {
+    var s: string = to_string(v)
+    var has_break: bool = false
+    var i: i64 = 0
+    while i < str_len(s) {
+        var c: string = str_char(s, i)
+        if c == "." || c == "e" || c == "E" {
+            has_break = true
+        }
+        i = i + 1
+    }
+    if !has_break {
+        s = s + ".0"
+    }
+    return s
+}
+
+func decode_array(bytes: table<i64>, pos: i64) -> (i64, i64) {
+    var (n, dp) = zd.array_tag(bytes, pos)
+    if n < 0 {
+        return (-1, -1)
+    }
+    var arr: i64 = td.new_array()
+    var p: i64 = dp
+    var i: i64 = 0
+    while i < n {
+        var (child, np) = decode_value(bytes, p)
+        if np < 0 {
+            return (-1, -1)
+        }
+        td.push_child(arr, "", child)
+        p = np
+        i = i + 1
+    }
+    return (arr, p)
+}
+
+func decode_map(bytes: table<i64>, pos: i64) -> (i64, i64) {
+    var (n, dp) = zd.map_tag(bytes, pos)
+    if n < 0 {
+        return (-1, -1)
+    }
+    var m: i64 = td.new_map()
+    var p: i64 = dp
+    var i: i64 = 0
+    while i < n {
+        var (k, kp) = zd.decode_string(bytes, p)
+        if kp < 0 {
+            return (-1, -1)
+        }
+        var (child, cp) = decode_value(bytes, kp)
+        if cp < 0 {
+            return (-1, -1)
+        }
+        td.push_child(m, k, child)
+        p = cp
+        i = i + 1
+    }
+    return (m, p)
+}
+}

@@ -1,0 +1,455 @@
+type tie<class>
+// tiedb/src/cli/json.tie —— 纯 JSON 工具库（解析器 + 写入器；依赖 tdata，无 main）
+// ============================================================================
+// jp_parse_value：JSON 文本 → td 节点 id（-1 失败）
+// json_write_node：td 节点 → JSON 字符串（写入 sb）
+
+import "../tdata.tie"
+
+func json_escape_into(sb: i64, s: string) {
+    var n: i64 = str_len(s)
+    var i: i64 = 0
+    while i < n {
+        var c: string = str_char(s, i)
+        var cp: i64 = char_code(c)
+        if cp == 34 {
+            sb_append(sb, "\\\"")
+        } else if cp == 92 {
+            sb_append(sb, "\\\\")
+        } else if cp == 8 {
+            sb_append(sb, "\\b")
+        } else if cp == 12 {
+            sb_append(sb, "\\f")
+        } else if cp == 10 {
+            sb_append(sb, "\\n")
+        } else if cp == 13 {
+            sb_append(sb, "\\r")
+        } else if cp == 9 {
+            sb_append(sb, "\\t")
+        } else if cp < 32 {
+            var digits: string = "0123456789ABCDEF"
+            sb_append(sb, "\\u00")
+            sb_append(sb, str_char(digits, (cp >> 4) & 15))
+            sb_append(sb, str_char(digits, cp & 15))
+        } else {
+            sb_append(sb, c)
+        }
+        i = i + 1
+    }
+}
+
+func json_quoted(sb: i64, s: string) {
+    sb_append(sb, "\"")
+    json_escape_into(sb, s)
+    sb_append(sb, "\"")
+}
+
+func json_indent(sb: i64, depth: i64) {
+    var i: i64 = 0
+    while i < depth {
+        sb_append(sb, "  ")
+        i = i + 1
+    }
+}
+
+func json_write_node(sb: i64, id: i64, depth: i64, indented: bool) {
+    var t: i64 = td.ty(id)
+    if t == 4 {
+        json_quoted(sb, td.txt(id))
+        return
+    }
+    if t == 8 {
+        json_quoted(sb, str_from_code(td.iv(id)))
+        return
+    }
+    if t == 2 || t == 3 {
+        sb_append(sb, td.txt(id))
+        return
+    }
+    if t == 1 {
+        if td.iv(id) == 1 {
+            sb_append(sb, "true")
+        } else {
+            sb_append(sb, "false")
+        }
+        return
+    }
+    if t == 7 {
+        sb_append(sb, to_string(td.iv(id)))
+        return
+    }
+    if t == 5 {
+        if td.alive_cnt(id) == 0 {
+            sb_append(sb, "[]")
+            return
+        }
+        sb_append(sb, "[")
+        var i: i64 = 0
+        while i < td.cnt(id) {
+            if td.ty(td.ch_at(id, i)) == 0 {
+                i = i + 1
+                continue
+            }
+            if i > 0 {
+                sb_append(sb, ",")
+            }
+            if indented {
+                sb_append(sb, "\n")
+                json_indent(sb, depth + 1)
+            }
+            json_write_node(sb, td.ch_at(id, i), depth + 1, indented)
+            i = i + 1
+        }
+        if indented {
+            sb_append(sb, "\n")
+            json_indent(sb, depth)
+        }
+        sb_append(sb, "]")
+        return
+    }
+    if t == 6 {
+        if td.alive_cnt(id) == 0 {
+            sb_append(sb, "{}")
+            return
+        }
+        sb_append(sb, "{")
+        var first: bool = true
+        var j: i64 = 0
+        while j < td.cnt(id) {
+            if td.ty(td.ch_at(id, j)) == 0 {
+                j = j + 1
+                continue
+            }
+            if !first {
+                sb_append(sb, ",")
+            }
+            first = false
+            if indented {
+                sb_append(sb, "\n")
+                json_indent(sb, depth + 1)
+            }
+            json_quoted(sb, td.key_at(id, j))
+            sb_append(sb, ": ")
+            json_write_node(sb, td.ch_at(id, j), depth + 1, indented)
+            j = j + 1
+        }
+        if indented {
+            sb_append(sb, "\n")
+            json_indent(sb, depth)
+        }
+        sb_append(sb, "}")
+        return
+    }
+}
+
+var jp_src: string = "";
+var jp_p: i64 = 0;
+
+func jp_eof() -> bool {
+    return jp_p >= str_len(jp_src)
+}
+
+func jp_peek() -> string {
+    return str_char(jp_src, jp_p)
+}
+
+func jp_peek_cp() -> i64 {
+    return char_code(str_char(jp_src, jp_p))
+}
+
+func jp_adv() {
+    jp_p = jp_p + 1
+}
+
+func jp_skip_ws() {
+    while !jp_eof() {
+        var c: i64 = jp_peek_cp()
+        if c == 32 || c == 9 || c == 10 || c == 13 {
+            jp_adv()
+        } else {
+            return
+        }
+    }
+}
+
+func jp_sub(start: i64, end: i64) -> string {
+    var sb = string_builder()
+    var i: i64 = start
+    while i < end {
+        sb_append(sb, str_char(jp_src, i))
+        i = i + 1
+    }
+    return sb_build(sb)
+}
+
+func jp_hex4() -> i64 {
+    var v: i64 = 0
+    var k: i64 = 0
+    while k < 4 {
+        if jp_eof() {
+            return -1
+        }
+        var c: string = jp_peek()
+        var d: i64 = -1
+        var cp: i64 = char_code(c)
+        if cp >= 48 && cp <= 57 {
+            d = cp - 48
+        } else if cp >= 97 && cp <= 102 {
+            d = cp - 87
+        } else if cp >= 65 && cp <= 70 {
+            d = cp - 55
+        }
+        if d < 0 {
+            return -1
+        }
+        v = v * 16 + d
+        jp_adv()
+        k = k + 1
+    }
+    return v
+}
+
+func jp_is_digit() -> bool {
+    if jp_eof() {
+        return false
+    }
+    var cp: i64 = jp_peek_cp()
+    return cp >= 48 && cp <= 57
+}
+
+func jp_string_node() -> i64 {
+    jp_adv()
+    var sb = string_builder()
+    while true {
+        if jp_eof() {
+            return -1
+        }
+        var c: string = jp_peek()
+        if c == "\"" {
+            jp_adv()
+            return td.new_str(sb_build(sb))
+        }
+        if c == "\\" {
+            jp_adv()
+            if jp_eof() {
+                return -1
+            }
+            var e: string = jp_peek()
+            var ec: i64 = jp_peek_cp()
+            if ec == 34 {
+                sb_append(sb, "\"")
+                jp_adv()
+            } else if ec == 47 {
+                sb_append(sb, "/")
+                jp_adv()
+            } else if ec == 92 {
+                sb_append(sb, "\\")
+                jp_adv()
+            } else if ec == 98 {
+                sb_append_byte(sb, 8)
+                jp_adv()
+            } else if ec == 102 {
+                sb_append_byte(sb, 12)
+                jp_adv()
+            } else if ec == 110 {
+                sb_append(sb, "\n")
+                jp_adv()
+            } else if ec == 114 {
+                sb_append(sb, "\r")
+                jp_adv()
+            } else if ec == 116 {
+                sb_append(sb, "\t")
+                jp_adv()
+            } else if ec == 117 {
+                jp_adv()
+                var cp: i64 = jp_hex4()
+                if cp < 0 {
+                    return -1
+                }
+                if cp >= 55296 && cp <= 56319 && jp_p + 1 < str_len(jp_src) {
+                    if str_char(jp_src, jp_p) == "\\" && str_char(jp_src, jp_p + 1) == "u" {
+                        var save: i64 = jp_p
+                        jp_adv()
+                        jp_adv()
+                        var lo: i64 = jp_hex4()
+                        if lo >= 56320 && lo <= 57343 {
+                            cp = 65536 + ((cp - 55296) << 10) + (lo - 56320)
+                        } else {
+                            jp_p = save
+                        }
+                    }
+                }
+                sb_append(sb, str_from_code(cp))
+            } else {
+                return -1
+            }
+            continue
+        }
+        if jp_peek_cp() < 32 {
+            return -1
+        }
+        sb_append(sb, c)
+        jp_adv()
+    }
+    return -1
+}
+
+func jp_number() -> i64 {
+    var start: i64 = jp_p
+    var is_float: bool = false
+    if !jp_eof() && jp_peek() == "-" {
+        jp_adv()
+    }
+    var any: bool = false
+    while jp_is_digit() {
+        any = true
+        jp_adv()
+    }
+    if !any {
+        return -1
+    }
+    if !jp_eof() && jp_peek() == "." {
+        is_float = true
+        jp_adv()
+        var frac: bool = false
+        while jp_is_digit() {
+            frac = true
+            jp_adv()
+        }
+        if !frac {
+            return -1
+        }
+    }
+    if !jp_eof() && (jp_peek() == "e" || jp_peek() == "E") {
+        is_float = true
+        jp_adv()
+        if !jp_eof() && (jp_peek() == "+" || jp_peek() == "-") {
+            jp_adv()
+        }
+        var ex: bool = false
+        while jp_is_digit() {
+            ex = true
+            jp_adv()
+        }
+        if !ex {
+            return -1
+        }
+    }
+    var raw: string = jp_sub(start, jp_p)
+    if is_float {
+        return td.new_float_text(raw)
+    }
+    return td.new_int_text(raw)
+}
+
+func jp_object(depth: i64) -> i64 {
+    jp_adv()
+    var m: i64 = td.new_map()
+    jp_skip_ws()
+    if !jp_eof() && jp_peek() == "}" {
+        jp_adv()
+        return m
+    }
+    while true {
+        jp_skip_ws()
+        if jp_eof() || jp_peek() != "\"" {
+            return -1
+        }
+        var key_node: i64 = jp_string_node()
+        if key_node < 0 {
+            return -1
+        }
+        var key: string = td.txt(key_node)
+        jp_skip_ws()
+        if jp_eof() || jp_peek() != ":" {
+            return -1
+        }
+        jp_adv()
+        var v: i64 = jp_value(depth + 1)
+        if v < 0 {
+            return -1
+        }
+        td.push_child(m, key, v)
+        jp_skip_ws()
+        if jp_eof() {
+            return -1
+        }
+        if jp_peek() == "," {
+            jp_adv()
+            continue
+        }
+        if jp_peek() == "}" {
+            jp_adv()
+            return m
+        }
+        return -1
+    }
+    return -1
+}
+
+func jp_array(depth: i64) -> i64 {
+    jp_adv()
+    var a: i64 = td.new_array()
+    jp_skip_ws()
+    if !jp_eof() && jp_peek() == "]" {
+        jp_adv()
+        return a
+    }
+    while true {
+        var v: i64 = jp_value(depth + 1)
+        if v < 0 {
+            return -1
+        }
+        td.push_child(a, "", v)
+        jp_skip_ws()
+        if jp_eof() {
+            return -1
+        }
+        if jp_peek() == "," {
+            jp_adv()
+            continue
+        }
+        if jp_peek() == "]" {
+            jp_adv()
+            return a
+        }
+        return -1
+    }
+    return -1
+}
+
+func jp_value(depth: i64) -> i64 {
+    jp_skip_ws()
+    if jp_eof() {
+        return -1
+    }
+    if depth > 256 {
+        return -1
+    }
+    var c: string = jp_peek()
+    if c == "{" {
+        return jp_object(depth)
+    }
+    if c == "[" {
+        return jp_array(depth)
+    }
+    if c == "\"" {
+        return jp_string_node()
+    }
+    if c == "t" {
+        jp_adv(); jp_adv(); jp_adv(); jp_adv()
+        return td.new_bool(true)
+    }
+    if c == "f" {
+        jp_adv(); jp_adv(); jp_adv(); jp_adv(); jp_adv()
+        return td.new_bool(false)
+    }
+    if c == "n" {
+        jp_adv(); jp_adv(); jp_adv(); jp_adv()
+        return td.new_trit(0)
+    }
+    if c == "-" || (char_code(c) >= 48 && char_code(c) <= 57) {
+        return jp_number()
+    }
+    return -1
+}

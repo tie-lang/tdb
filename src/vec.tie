@@ -1,0 +1,174 @@
+type tie<class>
+// tiedb/src/vec.tie —— 向量检索（namespace vecsearch，纯 tie 全新实现）
+// ============================================================================
+// v0.1：Flat 精确检索（全量扫描基线；HNSW/IVF-PQ 后置）。
+// 存储模型：ids: table<i64> + vecs: table<f64> **展平存储**——每个向量 dim 个
+// 连续元素，第 i 个向量位于 vecs[i*dim .. i*dim+dim)。规避 tie 嵌套表
+// （table<table<f64>>）运行时构造限制。ref 传入 ids/vecs 直接写回调用方全局表。
+
+namespace vecsearch {
+
+// l2：欧氏距离 sqrt(sum((a-b)^2))。维度不齐按较短者截断（防御）。
+pub func l2(a: table<f64>, b: table<f64>) -> f64 {
+    var s: f64 = 0.0
+    var n: i64 = len(a)
+    if len(b) < n {
+        n = len(b)
+    }
+    var i: i64 = 0
+    while i < n {
+        var d: f64 = a[i] - b[i]
+        s = s + d * d
+        i = i + 1
+    }
+    return sqrt(s)
+}
+
+// cosine：余弦距离 1 - dot/(|a||b|)，值域 [0,2]。零向量返回 1.0。
+pub func cosine(a: table<f64>, b: table<f64>) -> f64 {
+    var dot: f64 = 0.0
+    var na: f64 = 0.0
+    var nb: f64 = 0.0
+    var n: i64 = len(a)
+    if len(b) < n {
+        n = len(b)
+    }
+    var i: i64 = 0
+    while i < n {
+        dot = dot + a[i] * b[i]
+        na = na + a[i] * a[i]
+        nb = nb + b[i] * b[i]
+        i = i + 1
+    }
+    if na == 0.0 || nb == 0.0 {
+        return 1.0
+    }
+    return 1.0 - dot / (sqrt(na) * sqrt(nb))
+}
+
+// flat_add：插入向量（id 重复覆盖）。dim ≤0 时取 v 长度定维。
+pub func flat_add(ids: ref table<i64>, vecs: ref table<f64>, dim: i64, id: i64, v: table<f64>) {
+    var d: i64 = dim
+    if d <= 0 {
+        d = len(v)
+    }
+    var i: i64 = 0
+    while i < len(ids) {
+        if ids[i] == id {
+            var j: i64 = 0
+            while j < d && j < len(v) {
+                vecs[i * d + j] = v[j]
+                j = j + 1
+            }
+            return
+        }
+        i = i + 1
+    }
+    table_push(ids, id)
+    var j2: i64 = 0
+    while j2 < d {
+        table_push(vecs, v[j2])
+        j2 = j2 + 1
+    }
+}
+
+// flat_remove：按 id **逻辑删除**（id 置 -1 哨兵；search/add 跳过哨兵）。
+// tie 的 ref 表无法物理收缩，物理压缩（compact）由上层 save 时执行。命中 true。
+pub func flat_remove(ids: ref table<i64>, vecs: ref table<f64>, dim: i64, id: i64) -> bool {
+    var n: i64 = len(ids)
+    var i: i64 = 0
+    while i < n {
+        if ids[i] == id {
+            ids[i] = -1
+            return true
+        }
+        i = i + 1
+    }
+    return false
+}
+
+// flat_compact：物理压缩——移除 -1 哨兵行，展平表前移补位。
+// 返回保留的有效向量数。save 前调用以缩小持久化体积。
+pub func flat_compact(ids: ref table<i64>, vecs: ref table<f64>, dim: i64) -> i64 {
+    var n: i64 = len(ids)
+    var w: i64 = 0  // 写指针
+    var r: i64 = 0  // 读指针
+    while r < n {
+        if ids[r] >= 0 {
+            if w != r {
+                ids[w] = ids[r]
+                var j: i64 = 0
+                while j < dim {
+                    vecs[w * dim + j] = vecs[r * dim + j]
+                    j = j + 1
+                }
+            }
+            w = w + 1
+        }
+        r = r + 1
+    }
+    // 截断：tie 无原生 pop 多元素——用「新建拷回」模式（ref 表可整体赋值场景
+    // 受限），此处返回有效数，截断由调用方在重建表时执行；v0.1 约定 compact
+    // 只前移不缩容，尾部残留数据被 cnt 语义屏蔽。
+    return w
+}
+
+// flat_search：top-k 最近邻（metric: 0=l2, 1=cosine）。跳过 -1 哨兵 id。
+// 返回 id 表（升序近似）。k 超过有效数量时返回全部。
+pub func flat_search(ids: table<i64>, vecs: table<f64>, dim: i64,
+    q: table<f64>, k: i64, metric: i64) -> table<i64> {
+    var out = table_new_i64()
+    var n: i64 = len(ids)
+    if n == 0 || k <= 0 || dim <= 0 {
+        return out
+    }
+    var dists = table_new_f64()
+    var sids = table_new_i64()
+    var i: i64 = 0
+    while i < n {
+        if ids[i] >= 0 {
+            var v = table_new_f64()
+            var j: i64 = 0
+            while j < dim {
+                table_push(v, vecs[i * dim + j])
+                j = j + 1
+            }
+            var d: f64 = 0.0
+            if metric == 1 {
+                d = cosine(v, q)
+            } else {
+                d = l2(v, q)
+            }
+            table_push(dists, d)
+            table_push(sids, ids[i])
+        }
+        i = i + 1
+    }
+    var m: i64 = len(sids)
+    var take: i64 = k
+    if take > m {
+        take = m
+    }
+    // 简单选择排序取前 take
+    var t: i64 = 0
+    while t < take {
+        var best: i64 = t
+        var b: i64 = t + 1
+        while b < m {
+            if dists[b] < dists[best] {
+                best = b
+            }
+            b = b + 1
+        }
+        var td: f64 = dists[t]
+        var ti: i64 = sids[t]
+        dists[t] = dists[best]
+        sids[t] = sids[best]
+        dists[best] = td
+        sids[best] = ti
+        table_push(out, sids[t])
+        t = t + 1
+    }
+    return out
+}
+}

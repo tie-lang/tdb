@@ -1,0 +1,203 @@
+type tie<class>
+// tiedb/src/zd_stream.tie —— zd v2 流式分块 + 帧边界/CRC + 压缩变体声明（namespace zd_stream）
+// ============================================================================
+// 格式契约（zd v2 设计文档 §4.7/§6.6/§10，语言无关）：
+//   帧 = [len: u32 BE][payload: len 字节][crc: u32 BE]
+//     len = payload 字节数；crc = CRC32-IEEE(payload)（多项式 0xEDB88320，
+//     反射式逐位，无查表；校验向量 crc32("123456789") == 0xCBF43926）。
+//   压缩变体声明 = [0xC9 变体标签][algo: 1 字节][body]；
+//     algo：0=无 / 1=zstd / 2=lz4。**只声明不解压**（§10：压缩算法不内嵌实现，
+//     读端据 algo 自行接 zstd/lz4 解压）。
+//   头部 flags：bit3 = 流式（stream_flag() == 8）、bit4 = 压缩变体
+//     （compress_flag() == 16），配合 zd.header_info 读容器头 flags 判定。
+// 字节一律 table<i64>（0..255）；错误哨兵 -1，不 panic。
+// 复用 src/zd.tie 基础原语（u8_at / write_u32_be / read_u32_be / slice）。
+//
+// 调用：import 后 zd_stream.crc32(...) / chunk_encode / chunk_next / chunk_skip /
+//   chunks_concat / chunks_iter / encode_compressed / decode_compressed /
+//   stream_flag / compress_flag。
+
+import "./zd.tie"
+
+namespace zd_stream {
+
+// ---------- CRC32-IEEE（反射式逐位，无表） ----------
+// 与 tink 帧协议同多项式 0xEDB88320、同标准校验向量。
+// i64 的 `>>` 为算术右移，但 c 每步 < 2^32 且恒正，算术右移即逻辑右移。
+pub func crc32(bytes: table<i64>) -> i64 {
+    var c: i64 = 0xFFFFFFFF
+    var n: i64 = len(bytes)
+    var i: i64 = 0
+    while i < n {
+        c = c ^ (bytes[i] & 0xFF)
+        var k: i64 = 0
+        while k < 8 {
+            var lsb: i64 = c & 1
+            c = c >> 1
+            if lsb != 0 {
+                c = c ^ 0xEDB88320
+            }
+            k = k + 1
+        }
+        i = i + 1
+    }
+    return c ^ 0xFFFFFFFF
+}
+
+// ---------- 流式分块帧 ----------
+// chunk_encode：payload → 完整帧字节（len u32 BE + payload + crc u32 BE）。
+// 字节一律规范化为 0..255（& 0xFF）。
+pub func chunk_encode(payload: table<i64>) -> table<i64> {
+    var out = table_new_i64()
+    var n: i64 = len(payload)
+    table_push(out, (n >> 24) & 0xFF)
+    table_push(out, (n >> 16) & 0xFF)
+    table_push(out, (n >> 8) & 0xFF)
+    table_push(out, n & 0xFF)
+    var i: i64 = 0
+    while i < n {
+        table_push(out, payload[i] & 0xFF)
+        i = i + 1
+    }
+    var c: i64 = crc32(payload)
+    table_push(out, (c >> 24) & 0xFF)
+    table_push(out, (c >> 16) & 0xFF)
+    table_push(out, (c >> 8) & 0xFF)
+    table_push(out, c & 0xFF)
+    return out
+}
+
+// chunk_next：从 bytes[pos..] 解析一帧 → (payload, next_pos)；失败 (空表, -1)。
+// 严格校验 CRC；len 声称的字节越界亦拒绝。
+pub func chunk_next(bytes: table<i64>, pos: i64) -> (table<i64>, i64) {
+    var empty = table_new_i64()
+    var nb: i64 = len(bytes)
+    if pos < 0 {
+        return (empty, -1)
+    }
+    if pos + 7 >= nb {
+        return (empty, -1)
+    }
+    var n: i64 = ((bytes[pos] & 0xFF) << 24) | ((bytes[pos + 1] & 0xFF) << 16) |
+        ((bytes[pos + 2] & 0xFF) << 8) | (bytes[pos + 3] & 0xFF)
+    if n < 0 {
+        return (empty, -1)
+    }
+    if pos + 8 + n > nb {
+        return (empty, -1)
+    }
+    var payload = table_new_i64()
+    var i: i64 = 0
+    while i < n {
+        table_push(payload, bytes[pos + 4 + i] & 0xFF)
+        i = i + 1
+    }
+    var c: i64 = ((bytes[pos + 4 + n] & 0xFF) << 24) | ((bytes[pos + 5 + n] & 0xFF) << 16) |
+        ((bytes[pos + 6 + n] & 0xFF) << 8) | (bytes[pos + 7 + n] & 0xFF)
+    if crc32(payload) != c {
+        return (empty, -1)
+    }
+    return (payload, pos + 8 + n)
+}
+
+// chunk_skip：零拷贝跳过一帧 → next_pos；失败 -1。不校验 CRC，适合大 payload
+// 只读不拷、或批量帧快速定位（zd v2 偏移表思路的帧级版）。
+pub func chunk_skip(bytes: table<i64>, pos: i64) -> i64 {
+    var nb: i64 = len(bytes)
+    if pos < 0 {
+        return -1
+    }
+    if pos + 7 >= nb {
+        return -1
+    }
+    var n: i64 = ((bytes[pos] & 0xFF) << 24) | ((bytes[pos + 1] & 0xFF) << 16) |
+        ((bytes[pos + 2] & 0xFF) << 8) | (bytes[pos + 3] & 0xFF)
+    if n < 0 {
+        return -1
+    }
+    if pos + 8 + n > nb {
+        return -1
+    }
+    return pos + 8 + n
+}
+
+// ---------- 多帧组装 ----------
+// chunks_concat：payload 表 → 每块各自成帧，串接为流（表<table<i64>> 元素为 payload）。
+pub func chunks_concat(chunks: table<table<i64>>) -> table<i64> {
+    var out = table_new_i64()
+    var n: i64 = len(chunks)
+    var i: i64 = 0
+    while i < n {
+        var f: table<i64> = chunk_encode(chunks[i])
+        var j: i64 = 0
+        while j < len(f) {
+            table_push(out, f[j])
+            j = j + 1
+        }
+        i = i + 1
+    }
+    return out
+}
+
+// chunks_iter：按 chunk_next 循环取帧，收集各 payload → (payloads, next_pos)。
+// 任取帧失败返回 (已收集, -1)；流恰好耗尽时 next_pos == len(bytes)。
+pub func chunks_iter(bytes: table<i64>, pos: i64) -> (table<table<i64>>, i64) {
+    var out: table<table<i64>> = []
+    var p: i64 = pos
+    var nb: i64 = len(bytes)
+    while p < nb {
+        var (payload, np) = chunk_next(bytes, p)
+        if np < 0 {
+            return (out, -1)
+        }
+        table_push(out, payload)
+        p = np
+    }
+    return (out, p)
+}
+
+// ---------- 压缩变体声明（只声明，不解压） ----------
+// encode_compressed：body → [0xC9][algo][body]。algo：0=无 / 1=zstd / 2=lz4。
+pub func encode_compressed(body: table<i64>, algo: i64) -> table<i64> {
+    var out = table_new_i64()
+    table_push(out, 0xC9)
+    table_push(out, algo & 0xFF)
+    var i: i64 = 0
+    while i < len(body) {
+        table_push(out, body[i] & 0xFF)
+        i = i + 1
+    }
+    return out
+}
+
+// decode_compressed：读回变体声明 → (algo, body, next_pos)；非 0xC9 前缀失败
+// (-1, 空表, -1)。读端据 algo 自行接 zstd/lz4 解压。
+pub func decode_compressed(bytes: table<i64>, pos: i64) -> (i64, table<i64>, i64) {
+    var empty = table_new_i64()
+    if (zd.u8_at(bytes, pos) & 0xFF) != 0xC9 {
+        return (-1, empty, -1)
+    }
+    var algo: i64 = zd.u8_at(bytes, pos + 1) & 0xFF
+    if algo < 0 {
+        return (-1, empty, -1)
+    }
+    var body = table_new_i64()
+    var n: i64 = len(bytes)
+    var i: i64 = pos + 2
+    while i < n {
+        table_push(body, bytes[i] & 0xFF)
+        i = i + 1
+    }
+    return (algo, body, n)
+}
+
+// ---------- 头部 flags 位（配合 zd.header_info 判定流式/压缩） ----------
+// 容器头 flags bit3 = 流式、bit4 = 压缩变体。
+pub func stream_flag() -> i64 {
+    return 1 << 3
+}
+
+pub func compress_flag() -> i64 {
+    return 1 << 4
+}
+}

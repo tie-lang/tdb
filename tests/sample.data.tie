@@ -1,0 +1,9 @@
+// 样例数据：羁绊/棋子（td 格式）
+season_id = 3
+{
+    id = 8
+    name = "测试羁绊"
+    tier = 2
+    stats = [10, 20, 30]
+    tags = { key = "value", active = true }
+}

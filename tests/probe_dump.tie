@@ -1,0 +1,13 @@
+type tie<logic>
+import "../src/tdata.tie"
+
+func main() {
+    td.set_trace(true)
+    println("w")
+    var w: i64 = td.parse("[\"features\": [\"async\", \"macro\"]]")
+    println("w cnt=" + to_string(td.alive_cnt(w)))
+    td.debug_dump()
+    println("b")
+    var b: i64 = td.parse("[\"b\": 2]")
+    println("b cnt=" + to_string(td.cnt(b)) + " write=" + td.write(b))
+}

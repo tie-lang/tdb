@@ -1,0 +1,19 @@
+type tie<logic>
+// probe_encode2: file_read + parse + encode_node (极简版)
+import "../src/tdata.tie"
+import "../src/zd.tie"
+import "../src/codec.tie"
+
+func main() {
+    println("start")
+    var fname: string = arg_string(0)
+    var raw: string = file_read(fname)
+    var root: i64 = td.parse(raw)
+    println("alive=" + to_string(td.alive_cnt(root)))
+    var bytes: table<i64> = tdc.encode_node(root)
+    println("zd_encoded ok")
+    var outpath: string = fname + ".zd"
+    var ok: bool = zd.save(outpath, bytes)
+    println("save=" + to_string(ok))
+    println("done")
+}

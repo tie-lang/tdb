@@ -1,0 +1,201 @@
+type tie<logic>
+// probe_zd_extra: zd v2 体积/读速优化（字典池引用 / 列式容器 / 零拷贝视图 / 偏移表跳读）
+import "../src/zd.tie"
+import "../src/zd_extra.tie"
+
+var fails: i64 = 0
+
+func check(cond: bool, msg: string) {
+    if cond {
+        println("PASS " + msg)
+    } else {
+        println("FAIL " + msg)
+        fails = fails + 1
+    }
+}
+
+// bytes_equal：逐字节比较两个字节表
+func bytes_equal(a: table<i64>, b: table<i64>) -> bool {
+    if len(a) != len(b) {
+        return false
+    }
+    var i: i64 = 0
+    while i < len(a) {
+        if a[i] != b[i] {
+            return false
+        }
+        i = i + 1
+    }
+    return true
+}
+
+func main() {
+    println("start")
+
+    // ==================== 1. 字符串字典/引用（flags bit0） ====================
+    var pool = zd_extra.pool_build(["alpha", "beta", "gamma"])
+    check(len(pool) > 0, "pool built")
+    check(zd_extra.pool_index(pool, "alpha") == 0, "pool_index alpha=0")
+    check(zd_extra.pool_index(pool, "beta") == 1, "pool_index beta=1")
+    check(zd_extra.pool_index(pool, "gamma") == 2, "pool_index gamma=2")
+    check(zd_extra.pool_index(pool, "nope") == -1, "pool_index unknown=-1")
+
+    // 引用往返一致
+    var ref0 = zd_extra.encode_string_ref(pool, 0)
+    var (s0, n0) = zd_extra.decode_string_ref(pool, ref0, 0)
+    check(s0 == "alpha" && n0 == len(ref0), "ref roundtrip alpha")
+    var ref2 = zd_extra.encode_string_ref(pool, 2)
+    var (s2, n2) = zd_extra.decode_string_ref(pool, ref2, 0)
+    check(s2 == "gamma" && n2 == len(ref2), "ref roundtrip gamma")
+
+    // 重复字符串只存一次：同串查池同序号，引用只写 0xC8+varint 序号
+    var ia = zd_extra.pool_index(pool, "alpha")
+    var ib = zd_extra.pool_index(pool, "alpha")
+    var refa1 = zd_extra.encode_string_ref(pool, ia)
+    var refa2 = zd_extra.encode_string_ref(pool, ib)
+    check(ia == 0 && ib == 0 && len(refa1) == 2 && refa1[0] == 0xC8 && refa1[1] == 0,
+        "dict ref = 0xC8 + varint(0)")
+    check(bytes_equal(refa1, refa2), "duplicate string reuses same ref bytes")
+
+    // 重复输入池：pool_index 取首个出现，池内序号仍稳定
+    var dup_pool = zd_extra.pool_build(["x", "x", "y"])
+    check(zd_extra.pool_index(dup_pool, "x") == 0 && zd_extra.pool_index(dup_pool, "y") == 2,
+        "dup pool index first")
+    var (dx, _dn) = zd_extra.decode_string_ref(dup_pool, zd_extra.encode_string_ref(dup_pool, 1), 0)
+    check(dx == "x", "pool idx 1 = second 'x'")
+
+    // 坏引用：非 0xC8 tag 拒绝
+    var bad_ref = table_new_i64()
+    table_push(bad_ref, 0x2A)
+    var (bs, bnext) = zd_extra.decode_string_ref(pool, bad_ref, 0)
+    check(bs == "" && bnext < 0, "non-ref tag rejected")
+
+    // ==================== 2. 列式容器（flags bit1） ====================
+    var ci = table_new_i64()
+    table_push(ci, 1)
+    table_push(ci, 2)
+    table_push(ci, 3)
+    table_push(ci, 4)
+    var cf = table_new_f64()
+    table_push(cf, 1.5)
+    table_push(cf, 2.5)
+    var cs = table_new_string()
+    table_push(cs, "a")
+    table_push(cs, "bb")
+    table_push(cs, "ccc")
+    var cb = table_new_i64()
+    table_push(cb, 1)
+    table_push(cb, 0)
+    table_push(cb, 1)
+
+    var col_tys = table_new_i64()
+    table_push(col_tys, 0)
+    table_push(col_tys, 1)
+    table_push(col_tys, 2)
+    table_push(col_tys, 3)
+    var cols: table<table> = []
+    table_push(cols, ci)
+    table_push(cols, cf)
+    table_push(cols, cs)
+    table_push(cols, cb)
+
+    var enc = zd_extra.encode_columnar(4, col_tys, cols)
+    check(len(enc) > 0 && enc[0] == 0xD6, "columnar marker 0xD6")
+
+    var (d_tys, d_cols, d_next) = zd_extra.decode_columnar(enc, 0)
+    check(d_next == len(enc), "columnar full consume")
+    check(len(d_tys) == 4 && d_tys[0] == 0 && d_tys[1] == 1 && d_tys[2] == 2 && d_tys[3] == 3,
+        "columnar col_tys preserved")
+
+    var di0 = d_cols[0]
+    var di0t: table<i64> = di0
+    check(len(di0t) == 4 && di0t[0] == 1 && di0t[1] == 2 && di0t[2] == 3 && di0t[3] == 4,
+        "columnar i64 col restored")
+    var di1 = d_cols[1]
+    var di1t: table<f64> = di1
+    check(len(di1t) == 2 && di1t[0] == 1.5 && di1t[1] == 2.5, "columnar f64 col restored")
+    var di2 = d_cols[2]
+    var di2t: table<string> = di2
+    check(len(di2t) == 3 && di2t[0] == "a" && di2t[1] == "bb" && di2t[2] == "ccc",
+        "columnar string col restored")
+    var di3 = d_cols[3]
+    var di3t: table<i64> = di3
+    check(len(di3t) == 3 && di3t[0] == 1 && di3t[1] == 0 && di3t[2] == 1,
+        "columnar bool col restored")
+
+    // 列式 vs 逐 record 体积对比：f64 列每元素省 0xCB 类型标签字节（8 元素：
+    // 列式 = 4 字节头 + 64 字节 = 68 < 逐 record = 1 数组头 + 72 = 73）
+    var f8 = table_new_f64()
+    table_push(f8, 1.0)
+    table_push(f8, 2.0)
+    table_push(f8, 3.0)
+    table_push(f8, 4.0)
+    table_push(f8, 5.0)
+    table_push(f8, 6.0)
+    table_push(f8, 7.0)
+    table_push(f8, 8.0)
+    var one_f_ty = table_new_i64()
+    table_push(one_f_ty, 1)
+    var one_f_cols: table<table> = []
+    table_push(one_f_cols, f8)
+    var enc1 = zd_extra.encode_columnar(1, one_f_ty, one_f_cols)
+    var row_arr = zd.encode_f64_array(f8)
+    check(len(enc1) < len(row_arr), "columnar smaller than per-record")
+
+    // ==================== 3. 零拷贝引用读取（大 blob 只读） ====================
+    var es = zd.encode_string("hello world")
+    var (vstart, vlen, vnext) = zd_extra.decode_string_ref_view(es, 0)
+    check(vstart == 1 && vlen == 11 && vnext == 12, "view fixstr (1,11,12)")
+    var vslice = zd.slice(es, vstart, vstart + vlen)
+    check(bytes_equal(vslice, zd.utf8_encode("hello world")), "view slice roundtrip")
+
+    // str8（>31 字节）：头 2 字节，payload 起点 2
+    var long = "abcdefghijklmnopqrstuvwxyzABCDEFG"  // 33 字节
+    var el = zd.encode_string(long)
+    var (lstart, llen, lnext) = zd_extra.decode_string_ref_view(el, 0)
+    check(lstart == 2 && llen == 33 && lnext == 35, "view str8 (2,33,35)")
+    var lslice = zd.slice(el, lstart, lstart + llen)
+    check(bytes_equal(lslice, zd.utf8_encode(long)), "view str8 slice roundtrip")
+
+    // 非字符串 → 哨兵 (-1,-1,-1)
+    var notstr = zd.encode_i64(5)
+    var (v0, v1, v2) = zd_extra.decode_string_ref_view(notstr, 0)
+    check(v0 < 0 && v1 < 0 && v2 < 0, "view non-string rejected")
+
+    // ==================== 4. 偏移表跳读（O(1) 定位 + 快速跳过） ====================
+    var items = table_new_i64()
+    table_push(items, 10)
+    table_push(items, 20)
+    table_push(items, 30)
+    table_push(items, 40)
+    table_push(items, 50)
+    table_push(items, 60)
+    table_push(items, 70)
+    var off = zd_extra.encode_with_offsets(items, 3)
+    check(len(off) > 0 && off[0] == 0xD5, "offsets marker 0xD5")
+
+    var allok: bool = true
+    var k: i64 = 0
+    while k < 7 {
+        var p = zd_extra.offset_at(off, 0, k)
+        var (v, np) = zd.decode_i64(off, p)
+        if v != items[k] || np < 0 {
+            allok = false
+        }
+        k = k + 1
+    }
+    check(allok, "offset_at locates every item")
+
+    var p3 = zd_extra.offset_at(off, 0, 3)
+    var (v3, _np3) = zd.decode_i64(off, p3)
+    check(v3 == 40, "offset boundary item 3 = 40")
+    check(zd_extra.offset_at(off, 0, 99) == -1, "offset_at OOB -1")
+    check(zd_extra.offset_at(off, 0, -1) == -1, "offset_at neg -1")
+
+    if fails == 0 {
+        println("PASS all")
+    } else {
+        println("FAIL total=" + to_string(fails))
+    }
+    println("done")
+}

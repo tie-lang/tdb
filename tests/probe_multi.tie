@@ -1,0 +1,18 @@
+type tie<logic>
+// probe: 多模块 import 下 parse → write 稳定性测试
+import "../src/tdata.tie"
+import "../src/zd.tie"
+import "../src/codec.tie"
+import "../src/cli/json.tie"
+
+func main() {
+    println("step1: parse")
+    var root: i64 = td.parse("[\"name\": \"hello\", \"val\": 42]")
+    println("step2: alive_cnt=" + to_string(td.alive_cnt(root)))
+    println("step3: write")
+    var out: string = td.write(root)
+    println("step4: out=" + out)
+    println("step5: second parse")
+    var root2: i64 = td.parse("[\"b\": 2]")
+    println("step6: write2=" + td.write(root2))
+}

@@ -1,0 +1,15 @@
+type tie<logic>
+// probe_fronly: 只调 file_read + println，不调 td.write
+import "../src/tdata.tie"
+import "../src/zd.tie"
+import "../src/codec.tie"
+
+func main() {
+    println("start")
+    var fname: string = arg_string(0)
+    println("file=" + fname)
+    var raw: string = file_read(fname)
+    println("raw_len=" + to_string(str_len(raw)))
+    println("len=" + to_string(str_len(raw)))
+    println("done")
+}

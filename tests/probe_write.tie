@@ -1,0 +1,28 @@
+type tie<logic>
+// probe_write: td.write on literal-built tree vs file_read-built tree
+import "../src/tdata.tie"
+import "../src/zd.tie"
+import "../src/codec.tie"
+import "../src/cli/json.tie"
+
+func main() {
+    println("=== A: literal parse + write ===")
+    var a: i64 = td.parse("[\"x\": 1]")
+    println("alive_a=" + to_string(td.alive_cnt(a)))
+    println("write_a=" + td.write(a))
+
+    println("=== B: file_read + parse + write ===")
+    var fname: string = arg_string(0)
+    var raw: string = file_read(fname)
+    println("raw_len=" + to_string(str_len(raw)))
+    var b: i64 = td.parse(raw)
+    println("alive_b=" + to_string(td.alive_cnt(b)))
+    var btext: string = td.write(b)
+    println("write_b=" + btext)
+
+    println("=== C: parse_file + write ===")
+    var c: i64 = td.parse_file(fname)
+    println("alive_c=" + to_string(td.alive_cnt(c)))
+    var ctext: string = td.write(c)
+    println("write_c=" + ctext)
+}

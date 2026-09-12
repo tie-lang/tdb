@@ -1,4 +1,6 @@
 # 构建产物 / build artifacts
+bin/
+out/
 *.exe
 *.ll
 *.o

@@ -1,0 +1,555 @@
+type tie<class>
+// tiedb/src/api.tie —— tiedbapi 统一数据 API v2（namespace tiedb）
+// ============================================================================
+// 设计原则（v2 重写）：**零嵌套表**——所有集合状态都落在 tdata 节点池
+// （嵌套表在全局声明下元素类型退化，见探针结论）。
+//
+// 集合即节点：
+//   - KV 集合   = 一个 td map 节点（键 → 文档子节点），增删改查走 td 语义；
+//   - 向量集合  = 三个 td 数组节点：ids(int 节点)/vecs(float 节点，展平)/dim；
+// 库根节点：
+//   ["tiedb": 1, "collections": [ ["name":..., "kind":..., <载体>], ... ]]
+//
+// 持久化双载体：save_data/load_data（明文）；save_zd/load_zd（zd 二进制，
+// 经 encode_node/decode_value 与 zd 层互通——node↔bytes 通用互转桥）。
+//
+// SQL 后端（SQLite/PostgreSQL/MongoDB）：Rust 桥后置阶段，接口位预留于
+// backend 抽象注释；本地载体优先跑通全链路。
+
+import "./tdata.tie"
+import "./codec.tie"
+import "./vec.tie"
+import "./zd.tie"
+
+// ---------- 库状态 ----------
+
+var db_path: string = "";
+var g_root: i64 = -1;      // 库根 map 节点
+var g_colls: i64 = -1;     // collections 数组节点
+
+const KIND_KV: i64 = 0
+const KIND_VEC: i64 = 1
+
+// ---------- 连接 ----------
+
+// connect：打开（或创建）库。path 为载体基路径（不带扩展名时 save 双写）。
+pub func connect(path: string) -> i64 {
+    db_path = path
+    g_root = td.new_map()
+    td.push_child(g_root, "tiedb", td.new_int_text("1"))
+    g_colls = td.new_array()
+    td.push_child(g_root, "collections", g_colls)
+    return 0
+}
+
+// open：从明文文件装载库（等价 connect+load_data 组合的便捷入口）。
+pub func open(path: string) -> i64 {
+    var r: i64 = load_data(path)
+    if r < 0 {
+        return -1
+    }
+    return 0
+}
+
+// ---------- 集合管理 ----------
+
+// create_collection：kind 0=kv 行集 1=vector 向量集。重名返回既有句柄。
+// 句柄编码：数组下标 + 1（0 保留为非法哨兵）。集合体节点挂在 colls[k]。
+pub func create_collection(conn: i64, name: string, kind: i64) -> i64 {
+    var exist: i64 = find_collection(name)
+    if exist >= 0 {
+        return exist + 1
+    }
+    var c: i64 = td.new_map()
+    td.push_child(c, "name", td.new_str(name))
+    td.push_child(c, "kind", td.new_int_text(to_string(kind)))
+    if kind == KIND_KV {
+        td.push_child(c, "docs", td.new_map())
+    } else {
+        td.push_child(c, "dim", td.new_int_text("0"))
+        td.push_child(c, "ids", td.new_array())
+        td.push_child(c, "vecs", td.new_array())
+    }
+    td.push_child(g_colls, "", c)
+    return td.cnt(g_colls)
+}
+
+func find_collection(name: string) -> i64 {
+    var e: i64 = 0
+    while e < td.cnt(g_colls) {
+        var c: i64 = td.ch_at(g_colls, e)
+        if td.ty(c) == 6 && kv_name_of(c) == name {
+            return e + 1
+        }
+        e = e + 1
+    }
+    return 0
+}
+
+func kv_name_of(c: i64) -> string {
+    var k: i64 = 0
+    while k < td.cnt(c) {
+        if td.key_at(c, k) == "name" {
+            return td.txt(td.ch_at(c, k))
+        }
+        k = k + 1
+    }
+    return ""
+}
+
+func coll_node(handle: i64) -> i64 {
+    if handle <= 0 || handle > td.cnt(g_colls) {
+        return -1
+    }
+    return td.ch_at(g_colls, handle - 1)
+}
+
+func coll_kind(c: i64) -> i64 {
+    var k: i64 = 0
+    while k < td.cnt(c) {
+        if td.key_at(c, k) == "kind" {
+            return parse_int(td.txt(td.ch_at(c, k)))
+        }
+        k = k + 1
+    }
+    return -1
+}
+
+// ---------- KV 集合（关系型行集雏形：文档 = 子树） ----------
+
+// docs_of：取集合的 docs map 节点（kv 专用）。
+func docs_of(coll_handle: i64) -> i64 {
+    var c: i64 = coll_node(coll_handle)
+    var k: i64 = 0
+    while k < td.cnt(c) {
+        if td.key_at(c, k) == "docs" {
+            return td.ch_at(c, k)
+        }
+        k = k + 1
+    }
+    return -1
+}
+
+// kv_set：插入或覆盖文档（doc 克隆入库）。返回 true。
+pub func kv_set(coll: i64, key: string, doc: i64) -> bool {
+    var docs: i64 = docs_of(coll)
+    if docs < 0 {
+        return false
+    }
+    // 已存在则覆盖（后值覆盖语义：找槽覆写，否则追加）
+    var k: i64 = 0
+    while k < td.cnt(docs) {
+        if td.key_at(docs, k) == key {
+            overwrite_at(docs, k, doc)
+            return true
+        }
+        k = k + 1
+    }
+    td.push_child(docs, key, td.clone(doc))
+    return true
+}
+
+// overwrite_at：覆盖容器第 k 子（重建该槽：td 无原地换子 API，用标记替换——
+// 直接改写平铺段：ch 槽位赋新 id 即可，键不变）。
+func overwrite_at(container: i64, k: i64, doc: i64) {
+    ReplaceChild(container, k, td.clone(doc))
+}
+
+// ReplaceChild：需要触达 td 内部平铺表——通过导出的 replace_child 完成。
+func ReplaceChild(container: i64, k: i64, new_child: i64) {
+    td.replace_child(container, k, new_child)
+}
+
+// kv_get：按键取文档节点 id（库内只读引用）。缺失 -1。
+pub func kv_get(coll: i64, key: string) -> i64 {
+    var docs: i64 = docs_of(coll)
+    if docs < 0 {
+        return -1
+    }
+    var k: i64 = 0
+    while k < td.cnt(docs) {
+        if td.key_at(docs, k) == key {
+            return td.ch_at(docs, k)
+        }
+        k = k + 1
+    }
+    return -1
+}
+
+// kv_remove：物理删除键（td.remove_child 平铺段前移）。
+pub func kv_remove(coll: i64, key: string) -> bool {
+    var docs: i64 = docs_of(coll)
+    if docs < 0 {
+        return false
+    }
+    var k: i64 = 0
+    while k < td.cnt(docs) {
+        if td.key_at(docs, k) == key {
+            return td.remove_child(docs, k)
+        }
+        k = k + 1
+    }
+    return false
+}
+
+pub func kv_size(coll: i64) -> i64 {
+    return td.cnt(docs_of(coll))
+}
+
+pub func kv_key_at(coll: i64, k: i64) -> string {
+    return td.key_at(docs_of(coll), k)
+}
+
+// ---------- 向量集合 ----------
+
+func vec_field(coll: i64, field: string) -> i64 {
+    var c: i64 = coll_node(coll)
+    var k: i64 = 0
+    while k < td.cnt(c) {
+        if td.key_at(c, k) == field {
+            return td.ch_at(c, k)
+        }
+        k = k + 1
+    }
+    return -1
+}
+
+func vec_dim(coll: i64) -> i64 {
+    var d: i64 = vec_field(coll, "dim")
+    if d < 0 {
+        return 0
+    }
+    return parse_int(td.txt(td.ch_at(d, 0)))
+}
+
+// vec_insert：插入向量（首插定维；id 重复覆盖整行）。
+pub func vec_insert(coll: i64, id: i64, v: table<f64>) -> bool {
+    var dim_n: i64 = vec_field(coll, "dim")
+    var ids_n: i64 = vec_field(coll, "ids")
+    var vecs_n: i64 = vec_field(coll, "vecs")
+    if dim_n < 0 || ids_n < 0 || vecs_n < 0 {
+        return false
+    }
+    var cur_dim: i64 = parse_int(td.txt(td.ch_at(dim_n, 0)))
+    if cur_dim == 0 {
+        cur_dim = len(v)
+        td.txt_set(td.ch_at(dim_n, 0), to_string(cur_dim))
+    }
+    // 找已有行
+    var row: i64 = -1
+    var i: i64 = 0
+    while i < td.cnt(ids_n) {
+        if parse_int(td.txt(td.ch_at(ids_n, i))) == id {
+            row = i
+        }
+        i = i + 1
+    }
+    if row >= 0 {
+        var j: i64 = 0
+        while j < cur_dim && j < len(v) {
+            td.txt_set(td.ch_at(vecs_n, row * cur_dim + j), FloatText(v[j]))
+            j = j + 1
+        }
+        return true
+    }
+    // 新行：id 追加 + 展平向量逐元素追加
+    td.push_child(ids_n, "", td.new_int_text(to_string(id)))
+    var j2: i64 = 0
+    while j2 < len(v) {
+        td.push_child(vecs_n, "", td.new_float_text(FloatText(v[j2])))
+        j2 = j2 + 1
+    }
+    return true
+}
+
+func FloatText(v: f64) -> string {
+    var s: string = to_string(v)
+    var has_dot: bool = false
+    var has_exp: bool = false
+    var i: i64 = 0
+    while i < str_len(s) {
+        var c: string = str_char(s, i)
+        if c == "." {
+            has_dot = true
+        }
+        if c == "e" || c == "E" {
+            has_exp = true
+        }
+        i = i + 1
+    }
+    if !has_dot && !has_exp {
+        s = s + ".0"
+    }
+    return s
+}
+
+// vec_search：top-k 最近邻（L2）。返回 id 表（tie 运行时表）。
+pub func vec_search(coll: i64, q: table<f64>, k: i64) -> table<i64> {
+    var out = table_new_i64()
+    var ids_n: i64 = vec_field(coll, "ids")
+    var vecs_n: i64 = vec_field(coll, "vecs")
+    if ids_n < 0 || vecs_n < 0 || k <= 0 {
+        return out
+    }
+    var dim: i64 = parse_int(td.txt(td.ch_at(vec_field(coll, "dim"), 0)))
+    var n: i64 = td.cnt(ids_n)
+    if n == 0 {
+        return out
+    }
+    // 物化为运行时表交给 vecsearch
+    var rt_ids = table_new_i64()
+    var rt_vecs = table_new_f64()
+    var i: i64 = 0
+    while i < n {
+        table_push(rt_ids, parse_int(td.txt(td.ch_at(ids_n, i))))
+        var j: i64 = 0
+        while j < dim {
+            table_push(rt_vecs, parse_float(td.txt(td.ch_at(vecs_n, i * dim + j))))
+            j = j + 1
+        }
+        i = i + 1
+    }
+    return vecsearch.flat_search(rt_ids, rt_vecs, dim, q, k, 0)
+}
+
+// vec_remove：逻辑删除（id 置 -1 哨兵节点）。
+pub func vec_remove(coll: i64, id: i64) -> bool {
+    var ids_n: i64 = vec_field(coll, "ids")
+    if ids_n < 0 {
+        return false
+    }
+    var i: i64 = 0
+    while i < td.cnt(ids_n) {
+        if parse_int(td.txt(td.ch_at(ids_n, i))) == id {
+            td.txt_set(td.ch_at(ids_n, i), "-1")
+            return true
+        }
+        i = i + 1
+    }
+    return false
+}
+
+pub func vec_size(coll: i64) -> i64 {
+    var ids_n: i64 = vec_field(coll, "ids")
+    if ids_n < 0 {
+        return 0
+    }
+    var alive: i64 = 0
+    var i: i64 = 0
+    while i < td.cnt(ids_n) {
+        if parse_int(td.txt(td.ch_at(ids_n, i))) >= 0 {
+            alive = alive + 1
+        }
+        i = i + 1
+    }
+    return alive
+}
+
+// ---------- 持久化入口 ----------
+
+// save_data：库 → 明文 .data.tie。
+pub func save_data(path: string) -> bool {
+    return td.write_file(g_root, path)
+}
+
+// load_data：明文 .data.tie → 库（整体替换当前状态）。
+pub func load_data(path: string) -> i64 {
+    var root: i64 = td.parse_file(path)
+    if root < 0 {
+        println("tiedb: 载入失败: " + td.last_error())
+        return -1
+    }
+    return adopt_root(root)
+}
+
+func adopt_root(root: i64) -> i64 {
+    var colls: i64 = find_key_node(root, "collections")
+    if colls < 0 || td.ty(colls) != 5 {
+        println("tiedb: 载入失败: 缺少 collections")
+        return -1
+    }
+    g_root = td.clone(root)
+    g_colls = find_key_node(g_root, "collections")
+    return 0
+}
+
+func find_key_node(map_id: i64, key: string) -> i64 {
+    var k: i64 = 0
+    while k < td.cnt(map_id) {
+        if td.key_at(map_id, k) == key {
+            return td.ch_at(map_id, k)
+        }
+        k = k + 1
+    }
+    return -1
+}
+
+// ---------- zd 载体（node↔bytes 通用互转桥） ----------
+// encode_node：td 节点 → 自描述 zd 字节（按类型标签递归）。
+// 整数经 parse_int(txt)；超 i64 域的大数有损（限制注明）。
+
+pub func encode_node(id: i64) -> table<i64> {
+    var t: i64 = td.ty(id)
+    if t == 1 {
+        return zd.encode_bool(td.iv(id) == 1)
+    }
+    if t == 7 {
+        return zd.encode_trit(td.iv(id))
+    }
+    if t == 8 {
+        return zd.encode_char(str_from_code(td.iv(id)))
+    }
+    if t == 4 {
+        return zd.encode_string(td.txt(id))
+    }
+    if t == 2 {
+        return zd.encode_i64(parse_int(td.txt(id)))
+    }
+    if t == 3 {
+        return zd.encode_f64(parse_float(td.txt(id)))
+    }
+    if t == 5 {
+        var body = table_new_i64()
+        var k: i64 = 0
+        while k < td.cnt(id) {
+            body = zd.concat(body, encode_node(td.ch_at(id, k)))
+            k = k + 1
+        }
+        return zd.encode_array(td.cnt(id), body)
+    }
+    if t == 6 {
+        var body2 = table_new_i64()
+        var k2: i64 = 0
+        while k2 < td.cnt(id) {
+            body2 = zd.concat(body2, zd.encode_string(td.key_at(id, k2)))
+            body2 = zd.concat(body2, encode_node(td.ch_at(id, k2)))
+            k2 = k2 + 1
+        }
+        return zd.encode_array(td.cnt(id), body2)
+    }
+    return table_new_i64()
+}
+
+// decode_value：字节 → 新建 td 节点 → (节点 id, 新位置)。按首标签分派。
+pub func decode_value(bytes: table<i64>, pos: i64) -> (i64, i64) {
+    var tag: i64 = zd.u8_at(bytes, pos)
+    if tag < 0 {
+        return (-1, -1)
+    }
+    if tag == 0xC2 || tag == 0xC3 {
+        var (bv, np) = zd.decode_bool(bytes, pos)
+        if np < 0 {
+            return (-1, -1)
+        }
+        return (td.new_bool(bv == 1), np)
+    }
+    if tag == 0xC4 {
+        var (cv, np) = zd.decode_char(bytes, pos)
+        if np < 0 {
+            return (-1, -1)
+        }
+        return (td.new_char(char_code(cv)), np)
+    }
+    if tag == 0xC5 {
+        var (tv, np) = zd.decode_trit(bytes, pos)
+        if np < 0 {
+            return (-1, -1)
+        }
+        return (td.new_trit(tv), np)
+    }
+    if (tag >= 0xA0 && tag <= 0xBF) || tag == 0xD9 || tag == 0xDA || tag == 0xDB {
+        var (sv, np) = zd.decode_string(bytes, pos)
+        if np < 0 {
+            return (-1, -1)
+        }
+        return (td.new_str(sv), np)
+    }
+    // 整数族标签
+        var int_tag: bool = tag <= 0x7F || tag >= 0xE0 || tag == 0xCC || tag == 0xCD || tag == 0xCE || tag == 0xCF || tag == 0xD0 || tag == 0xD1 || tag == 0xD2 || tag == 0xD3
+        if int_tag {
+        var (iv, np) = zd.decode_i64(bytes, pos)
+        if np < 0 {
+            return (-1, -1)
+        }
+        return (td.new_int_text(to_string(iv)), np)
+    }
+    if tag == 0xCB {
+        var (fv, np) = zd.decode_f64(bytes, pos)
+        if np < 0 {
+            return (-1, -1)
+        }
+        return (td.new_float_text(FloatText(fv)), np)
+    }
+    if (tag >= 0x90 && tag <= 0x9F) || tag == 0xDC || tag == 0xDD {
+        return decode_array(bytes, pos)
+    }
+    // map 复用数组头区间判定（map 标签 0x80-0x8F/DE/DF 与数组不重叠）
+    if (tag >= 0x80 && tag <= 0x8F) || tag == 0xDE || tag == 0xDF {
+        return decode_map(bytes, pos)
+    }
+    return (-1, -1)
+}
+
+func decode_array(bytes: table<i64>, pos: i64) -> (i64, i64) {
+    var (n, dp) = zd.array_tag(bytes, pos)
+    if n < 0 {
+        return (-1, -1)
+    }
+    var arr: i64 = td.new_array()
+    var p: i64 = dp
+    var i: i64 = 0
+    while i < n {
+        var (child, np) = decode_value(bytes, p)
+        if np < 0 {
+            return (-1, -1)
+        }
+        td.push_child(arr, "", child)
+        p = np
+        i = i + 1
+    }
+    return (arr, p)
+}
+
+func decode_map(bytes: table<i64>, pos: i64) -> (i64, i64) {
+    var (n, dp) = zd.map_tag(bytes, pos)
+    if n < 0 {
+        return (-1, -1)
+    }
+    var m: i64 = td.new_map()
+    var p: i64 = dp
+    var i: i64 = 0
+    while i < n {
+        var (k, kp) = zd.decode_string(bytes, p)
+        if kp < 0 {
+            return (-1, -1)
+        }
+        var (child, cp) = decode_value(bytes, kp)
+        if cp < 0 {
+            return (-1, -1)
+        }
+        td.push_child(m, k, child)
+        p = cp
+        i = i + 1
+    }
+    return (m, p)
+}
+
+// save_zd：库 → zd 二进制文件（encode_node(root) + TIEDBZD 头）。
+pub func save_zd(path: string) -> bool {
+    return zd.save(path, tdc.encode_node(g_root))
+}
+
+// load_zd：zd 二进制 → 库。
+pub func load_zd(path: string) -> i64 {
+    var bytes: table<i64> = zd.load(path)
+    if len(bytes) == 0 {
+        println("tiedb: 载入失败: 非 zd 文件或空文件")
+        return -1
+    }
+    var (root, np) = tdc.decode_value(bytes, 0)
+    if np < 0 {
+        println("tiedb: 载入失败: zd 解码错误")
+        return -1
+    }
+    return adopt_root(root)
+}

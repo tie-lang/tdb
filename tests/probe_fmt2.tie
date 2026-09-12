@@ -1,0 +1,40 @@
+type tie<logic>
+// probe_fmt2: 精确模拟 cmd_fmt 路径（修正循环边界）
+import "../src/tdata.tie"
+import "../src/zd.tie"
+import "../src/codec.tie"
+import "../src/cli/json.tie"
+
+func parse_or_report(path: string) -> i64 {
+    var root: i64 = td.parse_file(path)
+    if root < 0 {
+        print_err("parse fail: " + td.last_error())
+    }
+    return root
+}
+
+func main() {
+    var total: i64 = arg_count()
+    println("argc=" + to_string(total))
+    // 测试1：file_read + td.parse（模拟 parse_file）
+    if total >= 1 {
+        var fname: string = arg_string(0)
+        println("=== test file_read + parse + write ===")
+        var raw: string = file_read(fname)
+        println("raw_len=" + to_string(str_len(raw)))
+        var root: i64 = td.parse(raw)
+        println("alive=" + to_string(td.alive_cnt(root)))
+        var body: string = td.write(root)
+        println("write=" + body)
+    }
+    // 测试2：parse_file + write（模拟 cmd_fmt）
+    if total >= 1 {
+        var fname2: string = arg_string(0)
+        println("=== test parse_file + write ===")
+        var root2: i64 = parse_or_report(fname2)
+        if root2 >= 0 {
+            var body2: string = td.write(root2)
+            println("write2=" + body2)
+        }
+    }
+}

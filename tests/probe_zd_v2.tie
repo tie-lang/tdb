@@ -1,0 +1,142 @@
+type tie<logic>
+// probe_zd_v2: zd v2 头部（base-48 "02"）+ v1 兼容读取 + 头部识别
+import "../src/zd.tie"
+
+var fails: i64 = 0
+
+func check(cond: bool, msg: string) {
+    if cond {
+        println("PASS " + msg)
+    } else {
+        println("FAIL " + msg)
+        fails = fails + 1
+    }
+}
+
+// 拼字节头：魔数 + d1 + d2 + flags
+func head(d1: i64, d2: i64, flags: i64) -> table<i64> {
+    var h = table_new_i64()
+    table_push(h, 0x54)
+    table_push(h, 0x49)
+    table_push(h, 0x45)
+    table_push(h, 0x44)
+    table_push(h, 0x42)
+    table_push(h, 0x5A)
+    table_push(h, 0x44)
+    table_push(h, d1)
+    table_push(h, d2)
+    table_push(h, flags)
+    return h
+}
+
+func v1_head() -> table<i64> {
+    var h = table_new_i64()
+    table_push(h, 0x54)
+    table_push(h, 0x49)
+    table_push(h, 0x45)
+    table_push(h, 0x44)
+    table_push(h, 0x42)
+    table_push(h, 0x5A)
+    table_push(h, 0x44)
+    table_push(h, 0x01)
+    return h
+}
+
+func main() {
+    println("start")
+    // 1. header_info：v2 头（魔数 + "02" + flags 0）
+    var v2h = head(0, 2, 0)
+    var (v2v, v2l, v2f) = zd.header_info(v2h)
+    check(v2v == 2 && v2l == 10 && v2f == 0, "v2 header_info (2,10,0)")
+
+    // 2. header_info：v2 头 + 非零 flags
+    var v2f1 = head(0, 2, 3)
+    var (v2v1, v2l1, v2f2) = zd.header_info(v2f1)
+    check(v2v1 == 2 && v2l1 == 10 && v2f2 == 3, "v2 header flags=3")
+
+    // 3. 非法：坏魔数
+    var bad = table_new_i64()
+    table_push(bad, 0x41)
+    table_push(bad, 0x42)
+    table_push(bad, 0x43)
+    table_push(bad, 0x44)
+    table_push(bad, 0x45)
+    table_push(bad, 0x46)
+    table_push(bad, 0x47)
+    table_push(bad, 0x00)
+    table_push(bad, 0x02)
+    table_push(bad, 0x00)
+    var (bv, bl, bf) = zd.header_info(bad)
+    check(bv < 0, "bad magic rejected")
+
+    // 4. 非法：版本数字越界（d2 = 48）
+    var over = head(0, 48, 0)
+    var (ov, ol, of) = zd.header_info(over)
+    check(ov < 0, "version digit 48 rejected")
+
+    // 5. 太短（9 字节不足 v2 头）
+    var short = zd.slice(v2h, 0, 9)
+    var (sv, sl, sf) = zd.header_info(short)
+    check(sv < 0, "short header rejected")
+
+    // 6. v1 读取：v1 头 + body
+    var v1raw = table_new_i64()
+    var v1h = v1_head()
+    var i: i64 = 0
+    while i < 8 {
+        table_push(v1raw, v1h[i])
+        i = i + 1
+    }
+    table_push(v1raw, 0x2A)  // body：单个 fixint 42
+    var (v1v, v1l, v1f) = zd.header_info(v1raw)
+    check(v1v == 1 && v1l == 8 && v1f == 0, "v1 header_info (1,8,0)")
+    check(zd.is_zd(v1raw), "is_zd v1 true")
+    check(zd.is_zd(v2h), "is_zd v2 true")
+    check(!zd.is_zd(bad), "is_zd bad false")
+
+    // 7. 文件级：save(v2) → 原始字节头校验 → load 往返
+    var outpath: string = arg_string(0) + ".zd"
+    var body = table_new_i64()
+    table_push(body, 0x2A)
+    var ok: bool = zd.save(outpath, body)
+    check(ok, "save v2 ok")
+    var raw = byte_read(outpath)
+    var (fv, fl, ff) = zd.header_info(raw)
+    check(fv == 2 && fl == 10 && ff == 0, "saved file is v2 header")
+    var pref_ok: bool = true
+    var pfix: table<i64> = [0x54, 0x49, 0x45, 0x44, 0x42, 0x5A, 0x44, 0x00, 0x02]
+    var k: i64 = 0
+    while k < 9 {
+        if raw[k] != pfix[k] {
+            pref_ok = false
+        }
+        k = k + 1
+    }
+    check(pref_ok, "saved prefix TIEDBZD+02")
+    var loaded: table<i64> = zd.load(outpath)
+    check(len(loaded) == 1 && loaded[0] == 0x2A, "v2 load roundtrip")
+
+    // 8. 文件级：save_v1 → load（v1 兼容读取）
+    var v1path: string = arg_string(0) + ".v1.zd"
+    var ok1: bool = zd.save_v1(v1path, body)
+    check(ok1, "save_v1 ok")
+    var raw1 = byte_read(v1path)
+    var (v1fv, v1fl, v1ff) = zd.header_info(raw1)
+    check(v1fv == 1 && v1fl == 8, "v1 file header (1,8)")
+    var loaded1: table<i64> = zd.load(v1path)
+    check(len(loaded1) == 1 && loaded1[0] == 0x2A, "v1 load roundtrip")
+
+    // 9. 非法文件 load → 空表
+    var badpath: string = arg_string(0) + ".bad"
+    var badbytes: table<i64> = [0x41, 0x42, 0x43, 0x44, 0x45, 0x46, 0x47, 0x00, 0x02, 0x00]
+    byte_write(badpath, badbytes)
+    var l0: table<i64> = zd.load(badpath)
+    check(len(l0) == 0, "bad file load empty")
+
+    if fails == 0 {
+        println("PASS all")
+    } else {
+        println("FAIL total=" + to_string(fails))
+    }
+    println("done")
+}

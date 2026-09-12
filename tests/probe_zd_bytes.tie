@@ -1,0 +1,111 @@
+type tie<logic>
+// probe_zd_bytes: zd bytes 核心类型（0xc6）+ u64 无符号语义（0xCF）探针
+import "../src/zd.tie"
+
+var fails: i64 = 0
+
+func check(cond: bool, msg: string) {
+    if cond {
+        println("PASS " + msg)
+    } else {
+        println("FAIL " + msg)
+        fails = fails + 1
+    }
+}
+
+func bytes_eq(a: table<i64>, b: table<i64>) -> bool {
+    if len(a) != len(b) {
+        return false
+    }
+    var i: i64 = 0
+    while i < len(a) {
+        if a[i] != b[i] {
+            return false
+        }
+        i = i + 1
+    }
+    return true
+}
+
+func main() {
+    println("start")
+    var min_i64: i64 = 0 - 9223372036854775807 - 1  // -2^63
+
+    // ---------- bytes ----------
+    // 1) 字节格式：0xC6 + u32 BE 长度 + 原始字节
+    var body: table<i64> = [0x01, 0x02, 0x03]
+    var enc = zd.encode_bytes(body)
+    var expect: table<i64> = [0xC6, 0, 0, 0, 3, 0x01, 0x02, 0x03]
+    check(bytes_eq(enc, expect), "encode_bytes format (0xC6+len+raw)")
+
+    // 2) 空 bytes
+    var enc0 = zd.encode_bytes(table_new_i64())
+    var expect0: table<i64> = [0xC6, 0, 0, 0, 0]
+    check(bytes_eq(enc0, expect0), "encode_bytes empty")
+
+    // 3) decode_bytes 往返
+    var (dec, dnext) = zd.decode_bytes(enc, 0)
+    check(dnext == 8 && bytes_eq(dec, body), "decode_bytes roundtrip")
+
+    // 4) bytes_view 零拷贝区间
+    var (start, n, vnext) = zd.bytes_view(enc, 0)
+    check(start == 5 && n == 3 && vnext == 8, "bytes_view offset/len/next")
+    // 视图内容与原始一致（不拷贝）
+    var view_ok: bool = true
+    var i: i64 = 0
+    while i < n {
+        if enc[start + i] != body[i] {
+            view_ok = false
+        }
+        i = i + 1
+    }
+    check(view_ok, "bytes_view content")
+
+    // 5) 非 0xC6 拒绝
+    var bad: table<i64> = [0xCB, 0, 0, 0, 1, 0x2A]
+    var (bv, bnext) = zd.decode_bytes(bad, 0)
+    check(bnext < 0, "decode_bytes rejects non-0xC6")
+    var (bs, bl, bvn) = zd.bytes_view(bad, 0)
+    check(bvn < 0, "bytes_view rejects non-0xC6")
+
+    // 6) 截断拒绝
+    var trunc = zd.slice(enc, 0, 6)  // 缺 2 字节原始数据
+    var (tv, tnext) = zd.decode_bytes(trunc, 0)
+    check(tnext < 0, "decode_bytes truncated rejected")
+
+    // ---------- u64 ----------
+    // 7) 字节格式：0xCF + 8 字节大端
+    var u0 = zd.encode_u64(0)
+    var expect_u0: table<i64> = [0xCF, 0, 0, 0, 0, 0, 0, 0, 0]
+    check(bytes_eq(u0, expect_u0), "encode_u64(0) format")
+
+    // 8) u64 max（-1 传入 = 全 FF）
+    var umax = zd.encode_u64(-1)
+    var expect_max: table<i64> = [0xCF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF]
+    check(bytes_eq(umax, expect_max), "encode_u64(u64 max) = 0xCF+FF*8")
+
+    // 9) 高位位模式（0x8000000000000000 = i64 min 传入）
+    var uhi = zd.encode_u64(min_i64)
+    var expect_hi: table<i64> = [0xCF, 0x80, 0, 0, 0, 0, 0, 0, 0]
+    check(bytes_eq(uhi, expect_hi), "encode_u64(0x8000..) = 0xCF+0x80..")
+
+    // 10) decode_u64 往返（含高位位模式）
+    var (d0, d0n) = zd.decode_u64(u0, 0)
+    check(d0n == 9 && d0 == 0, "decode_u64(0) roundtrip")
+    var (dmax, dmaxn) = zd.decode_u64(umax, 0)
+    check(dmaxn == 9 && dmax == -1, "decode_u64(max) = -1 bits")
+    var (dhi, dhin) = zd.decode_u64(uhi, 0)
+    check(dhin == 9 && dhi == min_i64, "decode_u64(0x8000..) = min_i64 bits")
+
+    // 11) 非 0xCF 拒绝
+    var bad64: table<i64> = [0xD3, 0, 0, 0, 0, 0, 0, 0, 0]
+    var (b64, b64n) = zd.decode_u64(bad64, 0)
+    check(b64n < 0, "decode_u64 rejects non-0xCF")
+
+    if fails == 0 {
+        println("PASS all")
+    } else {
+        println("FAIL total=" + to_string(fails))
+    }
+    println("done")
+}

@@ -1,0 +1,28 @@
+type tie<logic>
+// probe_encode: file_read + parse + tdc.encode_node，不调 td.write
+import "../src/tdata.tie"
+import "../src/zd.tie"
+import "../src/codec.tie"
+
+func main() {
+    println("start")
+    var fname: string = arg_string(0)
+    var raw: string = file_read(fname)
+    println("raw_len=" + to_string(str_len(raw)))
+    var root: i64 = td.parse(raw)
+    println("alive=" + to_string(td.alive_cnt(root)))
+    // 用 codec 编码代替 td.write
+    var bytes: table<i64> = tdc.encode_node(root)
+    println("zd_bytes encoded ok")
+    // 保存到 .zd 文件
+    var outpath: string = arg_string(0) + ".zd"
+    var ok: bool = zd.save(outpath, bytes)
+    println("save_ok=" + to_string(ok) + " path=" + outpath)
+    // 验证：加载回来
+    var loaded: table<i64> = zd.load(outpath)
+    println("loaded ok")
+    // 解码回 td
+    var node: i64 = tdc.decode_value(loaded, 0)
+    println("decoded_alive=" + to_string(td.alive_cnt(node)))
+    println("done")
+}

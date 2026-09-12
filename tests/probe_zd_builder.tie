@@ -1,0 +1,215 @@
+type tie<logic>
+// probe_zd_builder: zd v2 M3 性能优化探针 —— 字节构建器 + 批量编解码 + 性能对比
+// 覆盖：构建器 append 序列正确、encode/decode batch 往返一致（含空数组）、
+//       批量解码正确、性能对比（batch 耗时 <= concat 版）。
+import "../src/zd.tie"
+import "../src/zd_builder.tie"
+
+var fails: i64 = 0
+
+func check(cond: bool, msg: string) {
+    if cond {
+        println("PASS " + msg)
+    } else {
+        println("FAIL " + msg)
+        fails = fails + 1
+    }
+}
+
+func seq_eq(a: table<i64>, b: table<i64>) -> bool {
+    var n: i64 = len(a)
+    if len(b) != n {
+        return false
+    }
+    var i: i64 = 0
+    while i < n {
+        if a[i] != b[i] {
+            return false
+        }
+        i = i + 1
+    }
+    return true
+}
+
+func seq_eq_str(a: table<string>, b: table<string>) -> bool {
+    var n: i64 = len(a)
+    if len(b) != n {
+        return false
+    }
+    var i: i64 = 0
+    while i < n {
+        if a[i] != b[i] {
+            return false
+        }
+        i = i + 1
+    }
+    return true
+}
+
+func seq_eq_f64(a: table<f64>, b: table<f64>) -> bool {
+    var n: i64 = len(a)
+    if len(b) != n {
+        return false
+    }
+    var i: i64 = 0
+    while i < n {
+        if a[i] != b[i] {
+            return false
+        }
+        i = i + 1
+    }
+    return true
+}
+
+// 计时累计防优化（结果都被消费）
+var g_acc: i64 = 0
+
+func main() {
+    println("start")
+
+    // ========== 1. 字节构建器：append 序列正确 ==========
+    var b1 = zdb.new_builder()
+    zdb.b_append(b1, 0x01)
+    zdb.b_append(b1, 0x02)
+    zdb.b_append_bytes(b1, [0x03, 0x04, 0x05])
+    zdb.b_append_be32(b1, 0x01020304)
+    zdb.b_append_be64(b1, 0x0102030405060708)
+    zdb.b_append_varint(b1, 300)   // 300 → 0xAC 0x02
+    zdb.b_append_varint(b1, 0)     // 0 → 0x00
+    check(zdb.b_len(b1) == 2 + 3 + 4 + 8 + 2 + 1, "builder len after appends")
+    var got1 = zdb.b_build(b1)
+    check(zdb.b_len(b1) == 0, "builder emptied after b_build")
+    var expect1: table<i64> = [0x01, 0x02, 0x03, 0x04, 0x05, 0x01, 0x02, 0x03, 0x04,
+        0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0xAC, 0x02, 0x00]
+    check(seq_eq(got1, expect1), "builder append sequence")
+
+    // ========== 2. 批量 i64 编解码往返 ==========
+    var vi: table<i64> = [0, 1, 127, -1, -32, 128, 255, 256, 65535, -129,
+        -32768, 65536, 4294967295, -70000, 123456789012345, -123456789012345]
+    var enc_i = zdb.encode_i64_array_batch(vi)
+    var (dec_i, p_i) = zdb.decode_i64_array_batch(enc_i, 0)
+    check(p_i == len(enc_i), "i64 batch decode consumed all bytes")
+    check(seq_eq(dec_i, vi), "i64 array batch roundtrip")
+    var enc_i_zd = zd.encode_i64_array(vi)
+    check(seq_eq(enc_i, enc_i_zd), "i64 batch == zd.concat encode")
+
+    var ve: table<i64> = table_new_i64()
+    var enc_e = zdb.encode_i64_array_batch(ve)
+    var (dec_e, p_e) = zdb.decode_i64_array_batch(enc_e, 0)
+    check(len(dec_e) == 0 && p_e == 1, "empty i64 batch roundtrip")
+
+    // ========== 3. 批量 f64 编解码往返 ==========
+    var vf: table<f64> = [0.0, 1.5, -2.25, 3.14159, 1.0e300, -1.0e-300]
+    var enc_f = zdb.encode_f64_array_batch(vf)
+    var (dec_f, p_f) = zdb.decode_f64_array_batch(enc_f, 0)
+    check(p_f == len(enc_f), "f64 batch decode consumed all bytes")
+    check(seq_eq_f64(dec_f, vf), "f64 array batch roundtrip")
+
+    var vfe: table<f64> = table_new_f64()
+    var enc_fe = zdb.encode_f64_array_batch(vfe)
+    var (dec_fe, p_fe) = zdb.decode_f64_array_batch(enc_fe, 0)
+    check(len(dec_fe) == 0 && p_fe == 1, "empty f64 batch roundtrip")
+
+    // ========== 4. 批量字符串编解码往返 ==========
+    var vs: table<string> = ["", "hello", "你好世界", "a中b", "x", "aemoji"]
+    var enc_s = zdb.encode_string_array_batch(vs)
+    var (dec_s, p_s) = zdb.decode_string_array_batch(enc_s, 0)
+    check(p_s == len(enc_s), "string batch decode consumed all bytes")
+    check(seq_eq_str(dec_s, vs), "string array batch roundtrip")
+    var enc_s_zd = zd.encode_string_array(vs)
+    check(seq_eq(enc_s, enc_s_zd), "string batch == zd.concat encode")
+
+    var vse: table<string> = table_new_string()
+    var enc_se = zdb.encode_string_array_batch(vse)
+    var (dec_se, p_se) = zdb.decode_string_array_batch(enc_se, 0)
+    check(len(dec_se) == 0 && p_se == 1, "empty string batch roundtrip")
+
+    // ========== 5. decode_string_bulk 批量解码正确 ==========
+    // 手拼 3 个 fixstr：0xA1 'a'、0xA3 '中'（UTF-8 = E4 B8 AD）、0xA0 ''
+    var bulk: table<i64> = [0xA1, 0x61, 0xA3, 0xE4, 0xB8, 0xAD, 0xA0]
+    var (bulk_dec, bulk_p) = zdb.decode_string_bulk(bulk, 0, 3)
+    check(bulk_p == len(bulk), "bulk decode consumed all bytes")
+    var bulk_expect: table<string> = ["a", "中", ""]
+    check(seq_eq_str(bulk_dec, bulk_expect), "decode_string_bulk values")
+
+    // bulk 作用于真实编码数据：从 enc_s 的数组体连续解码 n 个字符串
+    var (n6, dp6) = zd.array_tag(enc_s, 0)
+    var (bulk2, p2b) = zdb.decode_string_bulk(enc_s, dp6, n6)
+    check(seq_eq_str(bulk2, vs), "decode_string_bulk on batch data")
+
+    // ========== 6. 性能对比（time_now 秒级计时；batch <= concat） ==========
+    var N: i64 = 2000
+    var big_i: table<i64> = table_new_i64()
+    var big_s: table<string> = table_new_string()
+    var k: i64 = 0
+    while k < N {
+        table_push(big_i, (k * 7) % 1000 - 500)
+        table_push(big_s, "item" + to_string(k) + "_中" + to_string(k))
+        k = k + 1
+    }
+
+    // i64 数组：concat 版 vs batch 版
+    var RI: i64 = 200
+    var t0 = time_now()
+    var acc1: i64 = 0
+    var i1: i64 = 0
+    while i1 < RI {
+        var enc = zd.encode_i64_array(big_i)
+        acc1 = acc1 + len(enc)
+        i1 = i1 + 1
+    }
+    g_acc = g_acc + acc1
+    var t1 = time_now()
+    var ci64 = t1 - t0
+
+    var t2 = time_now()
+    var acc2: i64 = 0
+    var i2: i64 = 0
+    while i2 < RI {
+        var enc = zdb.encode_i64_array_batch(big_i)
+        acc2 = acc2 + len(enc)
+        i2 = i2 + 1
+    }
+    g_acc = g_acc + acc2
+    var t3 = time_now()
+    var bi64 = t3 - t2
+
+    println("perf i64 N=2000 x" + to_string(RI) + ": concat=" + to_string(ci64) + "s batch=" + to_string(bi64) + "s")
+    check(bi64 <= ci64, "i64 batch not slower than concat (" + to_string(bi64) + " <= " + to_string(ci64) + ")")
+
+    // string 数组：concat 版 vs batch 版
+    var RS: i64 = 20
+    var u0 = time_now()
+    var acc3: i64 = 0
+    var j1: i64 = 0
+    while j1 < RS {
+        var enc = zd.encode_string_array(big_s)
+        acc3 = acc3 + len(enc)
+        j1 = j1 + 1
+    }
+    g_acc = g_acc + acc3
+    var u1 = time_now()
+    var cs = u1 - u0
+
+    var u2 = time_now()
+    var acc4: i64 = 0
+    var j2: i64 = 0
+    while j2 < RS {
+        var enc = zdb.encode_string_array_batch(big_s)
+        acc4 = acc4 + len(enc)
+        j2 = j2 + 1
+    }
+    g_acc = g_acc + acc4
+    var u3 = time_now()
+    var bs = u3 - u2
+
+    println("perf string N=2000 x" + to_string(RS) + ": concat=" + to_string(cs) + "s batch=" + to_string(bs) + "s")
+    check(bs <= cs, "string batch not slower than concat (" + to_string(bs) + " <= " + to_string(cs) + ")")
+
+    if fails == 0 {
+        println("PASS all")
+    } else {
+        println("FAIL total=" + to_string(fails))
+    }
+    println("done")
+}

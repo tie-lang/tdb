@@ -1,0 +1,15 @@
+type tie<logic>
+// probe_parse_only: file_read + td.parse，不调 td.write
+import "../src/tdata.tie"
+import "../src/zd.tie"
+import "../src/codec.tie"
+
+func main() {
+    println("start")
+    var fname: string = arg_string(0)
+    var raw: string = file_read(fname)
+    println("raw_len=" + to_string(str_len(raw)))
+    var root: i64 = td.parse(raw)
+    println("alive=" + to_string(td.alive_cnt(root)))
+    println("done")
+}

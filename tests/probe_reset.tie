@@ -1,0 +1,21 @@
+type tie<logic>
+// probe_reset: file_read 后插入 sb_build(string_builder()) 重置状态测试
+import "../src/tdata.tie"
+import "../src/zd.tie"
+import "../src/codec.tie"
+import "../src/cli/json.tie"
+
+func main() {
+    println("A: file_read + sb_reset + parse + write")
+    var fname: string = arg_string(0)
+    var raw: string = file_read(fname)
+    // 假设：file_read 留下脏状态；强制 sb 操作可能重置
+    var _dummy = string_builder()
+    sb_append(_dummy, "")
+    var _ = sb_build(_dummy)
+    println("raw_len=" + to_string(str_len(raw)))
+    var root: i64 = td.parse(raw)
+    println("alive=" + to_string(td.alive_cnt(root)))
+    var body: string = td.write(root)
+    println("write=" + body)
+}

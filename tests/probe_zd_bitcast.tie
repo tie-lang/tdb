@@ -1,0 +1,128 @@
+type tie<logic>
+// probe_zd_bitcast: f64 bitcast 快路径（M1 原语接入 zd_builder）——字节等价 + 往返 + 边界
+import "../src/zd_builder.tie"
+import "../src/zd.tie"
+
+var fails: i64 = 0
+
+func check(cond: bool, msg: string) {
+    if cond {
+        println("PASS " + msg)
+    } else {
+        println("FAIL " + msg)
+        fails = fails + 1
+    }
+}
+
+// fast_f64_bytes：bitcast 直写 f64 帧（0xCB + 8 字节）
+func fast_f64_bytes(x: f64) -> table<i64> {
+    var buf = zdb.new_builder()
+    zdb.b_append_f64(buf, x)
+    return zdb.b_build(buf)
+}
+
+func main() {
+    println("start")
+    var neg_zero: f64 = -1.0 * 0.0
+
+    var cases: table<f64> = table_new_f64()
+    table_push(cases, 1.0)
+    table_push(cases, -2.5)
+    table_push(cases, neg_zero)
+    table_push(cases, 1.0 / 0.0)
+    table_push(cases, -1.0 / 0.0)
+    table_push(cases, parse_float("nan"))
+    table_push(cases, parse_float("1e100"))
+    table_push(cases, parse_float("1e-300"))
+
+    // 1) bitcast 直写与 zd.write_f64_be 数学分解字节等价
+    //   （仅常规值：数学分解对次正规简化为 ±0、对 NaN 规范化，位模式必不同；
+    //     bitcast 保留真实位模式，更精确——见检查 2 往返）
+    var exact: table<f64> = table_new_f64()
+    table_push(exact, 1.0)
+    table_push(exact, -2.5)
+    table_push(exact, neg_zero)
+    table_push(exact, 1.0 / 0.0)
+    table_push(exact, -1.0 / 0.0)
+    var i: i64 = 0
+    var bytes_ok: bool = true
+    while i < len(exact) {
+        var fb = fast_f64_bytes(exact[i])
+        var refb = zd.write_f64_be(exact[i])
+        var k: i64 = 0
+        while k < 8 {
+            if fb[k + 1] != refb[k] {
+                bytes_ok = false
+            }
+            k = k + 1
+        }
+        i = i + 1
+    }
+    check(bytes_ok, "f64 bitcast bytes match zd.write_f64_be (normal cases)")
+
+    // 2) decode_f64_fast 往返 == 原值（NaN 特判）
+    var j: i64 = 0
+    var rt_ok: bool = true
+    while j < len(cases) {
+        var fb = fast_f64_bytes(cases[j])
+        var (v, np) = zdb.decode_f64_fast(fb, 0)
+        if np != 9 {
+            rt_ok = false
+        } else if cases[j] != cases[j] {
+            if !(v != v) {
+                rt_ok = false
+            }
+        } else if v != cases[j] {
+            rt_ok = false
+        }
+        j = j + 1
+    }
+    check(rt_ok, "decode_f64_fast roundtrip (8 cases)")
+
+    // 3) decode_f64_fast 与 zd.read_f64_be 一致
+    var kk: i64 = 0
+    var eq_ok: bool = true
+    while kk < len(cases) {
+        var fb = fast_f64_bytes(cases[kk])
+        var (v1, p1) = zdb.decode_f64_fast(fb, 0)
+        var (v2, p2) = zd.read_f64_be(fb, 1)
+        if p1 != 9 || p2 != 9 || v1 != v2 {
+            eq_ok = false
+        }
+        kk = kk + 1
+    }
+    check(eq_ok, "decode_f64_fast == zd.read_f64_be")
+
+    // 4) 非法标签拒绝
+    var bad: table<i64> = [0xCA, 0, 0, 0, 0, 0, 0, 0, 0]
+    var (bv, bp) = zdb.decode_f64_fast(bad, 0)
+    check(bp < 0, "decode_f64_fast rejects non-0xCB")
+
+    // 5) 批量 f64 数组（encode_f64_array_batch 已改用 bitcast）往返
+    var arr: table<f64> = table_new_f64()
+    var n: i64 = 0
+    while n < 100 {
+        table_push(arr, as_f64(n) * 0.5)
+        n = n + 1
+    }
+    var enc = zdb.encode_f64_array_batch(arr)
+    var (dec, dend) = zdb.decode_f64_array_batch(enc, 0)
+    var arr_ok: bool = dend >= 0 && len(dec) == 100
+    if arr_ok {
+        var m: i64 = 0
+        while m < 100 {
+            if dec[m] != arr[m] {
+                arr_ok = false
+            }
+            m = m + 1
+        }
+    }
+    check(arr_ok, "f64 array batch bitcast roundtrip (100)")
+
+    if fails == 0 {
+        println("PASS all")
+    } else {
+        println("FAIL total=" + to_string(fails))
+    }
+    println("done")
+}

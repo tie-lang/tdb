@@ -1,0 +1,225 @@
+type tie<logic>
+// probe_zd_ext: zd v2 扩展能力 + 自描述/完整性里程碑（M5 + M6）探针
+// ============================================================================
+// 覆盖：null 编解码、optional 缺失/有值/值为 0 三者区分、ext 往返（含未知 tag 跳过）、
+//       flags 置位读取、schema 往返、内容哈希一致性与篡改检测。
+// 参考既有 tests/probe_zd_v2.tie 的 PASS/FAIL 风格与 main 结构。
+import "../src/zd.tie"
+import "../src/zd_ext.tie"
+
+var fails: i64 = 0
+
+func check(cond: bool, msg: string) {
+    if cond {
+        println("PASS " + msg)
+    } else {
+        println("FAIL " + msg)
+        fails = fails + 1
+    }
+}
+
+func eq_bytes(a: table<i64>, b: table<i64>) -> bool {
+    if len(a) != len(b) {
+        return false
+    }
+    var i: i64 = 0
+    while i < len(a) {
+        if a[i] != b[i] {
+            return false
+        }
+        i = i + 1
+    }
+    return true
+}
+
+func eq_strs(a: table<string>, b: table<string>) -> bool {
+    if len(a) != len(b) {
+        return false
+    }
+    var i: i64 = 0
+    while i < len(a) {
+        if a[i] != b[i] {
+            return false
+        }
+        i = i + 1
+    }
+    return true
+}
+
+func main() {
+    println("start")
+
+    // ========== 1. null 编解码 ==========
+    var null_bytes = zd_ext.encode_null()
+    check(eq_bytes(null_bytes, [0xC0]), "encode_null = [0xC0]")
+    var (n_ok, n_next) = zd_ext.decode_null(null_bytes, 0)
+    check(n_ok && n_next == 1, "decode_null ok next=1")
+    // 0x00 是 fixint 0（整数值 0），不是 null
+    var (z_ok, z_next) = zd_ext.decode_null([0x00], 0)
+    check(!z_ok, "decode_null rejects fixint 0x00")
+    // 越界：空表
+    var (e_ok, e_next) = zd_ext.decode_null(table_new_i64(), 0)
+    check(!e_ok, "decode_null rejects oob empty")
+
+    // ========== 2. optional 缺失/有值/值为 0 三者区分 ==========
+    // 有值 5
+    var enc5 = zd_ext.encode_optional_i64(5, true)
+    check(eq_bytes(enc5, [0x05]), "optional present 5 -> [0x05]")
+    var (p5, v5, x5) = zd_ext.decode_optional_i64(enc5, 0)
+    check(p5 && v5 == 5 && x5 == 1, "optional decode present=5")
+    // 值为 0
+    var enc0 = zd_ext.encode_optional_i64(0, true)
+    check(eq_bytes(enc0, [0x00]), "optional value 0 -> [0x00]")
+    var (p0, v0, x0) = zd_ext.decode_optional_i64(enc0, 0)
+    check(p0 && v0 == 0 && x0 == 1, "optional decode value=0 (present)")
+    // 缺失
+    var enc_m = zd_ext.encode_optional_i64(0, false)
+    check(eq_bytes(enc_m, [0xC0]), "optional missing -> [0xC0]")
+    var (pm, vm, xm) = zd_ext.decode_optional_i64(enc_m, 0)
+    check(!pm && xm == 1, "optional decode missing (present=false)")
+    // 三态严格区分：缺失 (false,0) ≠ 值为 0 (true,0)
+    check(!pm && p0 && v0 == 0, "optional tri-state: missing vs value-0 distinguished")
+    // 大负值往返
+    var big: i64 = 0 - 1234567890123
+    var enc_big = zd_ext.encode_optional_i64(big, true)
+    var (pb, vb, xb) = zd_ext.decode_optional_i64(enc_big, 0)
+    check(pb && vb == big && xb == len(enc_big), "optional big negative roundtrip")
+
+    // ========== 3. ext 往返（含未知 tag 跳过） ==========
+    // 已知类型
+    var payload: table<i64> = [0x2A, 0x2B]
+    var ext1 = zd_ext.encode_ext(1, payload)
+    check(eq_bytes(ext1, [0xD7, 0x01, 0x02, 0x2A, 0x2B]), "encode_ext(1,[2A,2B])")
+    var (t1, pl1, x1) = zd_ext.decode_ext(ext1, 0)
+    check(t1 == 1 && eq_bytes(pl1, payload) && x1 == 5, "decode_ext roundtrip")
+    // 多字节 varint tag（300）
+    var ext2 = zd_ext.encode_ext(300, [0x01])
+    var (t2, pl2, x2) = zd_ext.decode_ext(ext2, 0)
+    check(t2 == 300 && eq_bytes(pl2, [0x01]) && x2 == len(ext2), "ext tag 300 multi-byte varint")
+    // 未知 tag 跳过：next = ext 占用区间 end，可续读后续数据
+    var unknown_payload: table<i64> = [0xAA, 0xBB]
+    var unknown_ext = zd_ext.encode_ext(99, unknown_payload)
+    var stream = zd.concat(unknown_ext, [0x63])   // 后续独立 fixint 99
+    var (tu, plu, xu) = zd_ext.decode_ext(stream, 0)
+    check(tu == 99 && eq_bytes(plu, unknown_payload) && xu == 5, "unknown ext returns byte range end")
+    var (after_v, after_n) = zd.decode_i64(stream, xu)
+    check(after_v == 99 && after_n == 6, "decode after unknown ext skips cleanly")
+    // 非 0xD7 头 → 错误哨兵
+    var (tn, pln, xn) = zd_ext.decode_ext([0x2A], 0)
+    check(tn == -1 && xn == -1, "decode_ext rejects non-0xD7")
+    // 载荷截断 → 错误哨兵
+    var trunc = zd_ext.encode_ext(5, [0x01, 0x02])
+    var (tt2, plt2, xt2) = zd_ext.decode_ext(zd.slice(trunc, 0, 3), 0)
+    check(tt2 == -1 && xt2 == -1, "decode_ext rejects truncated payload")
+    // tie 特有 char/trit 与 code（tie-IR）载荷走 ext 子类型
+    var ch = zd_ext.encode_ext(1, zd.utf8_encode("A"))        // tag 1 = char
+    var (tc, plc, xc) = zd_ext.decode_ext(ch, 0)
+    check(tc == 1 && eq_bytes(plc, zd.utf8_encode("A")), "ext char subtype (tag=1)")
+    var tr = zd_ext.encode_ext(2, [0x01])                      // tag 2 = trit（+1）
+    var (tt, plt, xt) = zd_ext.decode_ext(tr, 0)
+    check(tt == 2 && eq_bytes(plt, [0x01]), "ext trit subtype (tag=2)")
+    var code_payload = table_new_i64()
+    code_payload = zd.concat(code_payload, [0x54, 0x49, 0x45, 0x49, 0x52])  // "TIEIR" 魔数
+    code_payload = zd.concat(code_payload, zd.write_varint(0))              // 首段长度
+    var cd = zd_ext.encode_ext(3, code_payload)                // tag 3 = code（tie-IR）
+    var (tcd, plcd, xcd) = zd_ext.decode_ext(cd, 0)
+    check(tcd == 3 && eq_bytes(plcd, code_payload) && xcd == len(cd), "ext code/tie-IR subtype (tag=3)")
+
+    // ========== 4. flags 置位读取（bit2 = ext） ==========
+    check(zd_ext.set_flag(0, 2) == 4, "set_flag(0,2) == 4 (bit2=ext)")
+    check(zd_ext.set_flag(0, 0) == 1, "set_flag(0,0) == 1")
+    check(zd_ext.has_flag(4, 2), "has_flag(4,2) true")
+    check(!zd_ext.has_flag(4, 0), "has_flag(4,0) false")
+    var f_comb = zd_ext.set_flag(zd_ext.set_flag(0, 2), 4)
+    check(f_comb == 20, "set_flag combine bits 2+4 = 20")
+    check(zd_ext.has_flag(f_comb, 4) && zd_ext.has_flag(f_comb, 2), "combined flags readable")
+    // 完整文件头：含 ext 容器 → flags 置位 bit2 → header_info 读回
+    var body_with_ext = zd_ext.encode_ext(7, [0x01, 0x02])
+    var header = zd_ext.make_header(zd_ext.set_flag(0, 2))
+    check(len(header) == 10, "make_header 10 bytes")
+    var hdr_file = zd.concat(header, body_with_ext)
+    var (hfv, hfl, hff) = zd.header_info(hdr_file)
+    check(hfv == 2 && hfl == 10 && zd_ext.has_flag(hff, 2), "header_info reads ext flag bit2")
+    // 落盘：save_with_flags → byte_read → header_info
+    var fpath: string = arg_string(0) + ".flags.zd"
+    var okf = zd_ext.save_with_flags(fpath, body_with_ext, zd_ext.set_flag(0, 2))
+    check(okf, "save_with_flags ok")
+    var fraw = byte_read(fpath)
+    var (ffv, ffl, fff) = zd.header_info(fraw)
+    check(ffv == 2 && ffl == 10 && zd_ext.has_flag(fff, 2), "saved file ext flag set+read")
+    // 未置位（flags=0）时读取不到 ext 位
+    var plain = zd.concat(zd_ext.make_header(0), body_with_ext)
+    var (pv, pl0, pf) = zd.header_info(plain)
+    check(pv == 2 && !zd_ext.has_flag(pf, 2), "flags=0 header no ext bit")
+
+    // ========== 5. schema 往返 ==========
+    var names: table<string> = ["id", "name", "score"]
+    var tys: table<i64> = [0, 2, 1]     // 0=i64 2=string 1=f64（调用方约定）
+    var schema_bytes = zd_ext.encode_schema(names, tys)
+    var (dn, dt, ds_next) = zd_ext.decode_schema(schema_bytes, 0)
+    check(eq_strs(dn, names), "schema names roundtrip")
+    check(eq_bytes(dt, tys), "schema types roundtrip")
+    check(ds_next == len(schema_bytes), "schema segment self-delimited")
+    // 格式不符 → 错误哨兵
+    var (dnb, dtb, dsb) = zd_ext.decode_schema([0x2A], 0)
+    check(dsb == -1 && len(dnb) == 0, "decode_schema rejects non-map")
+    // encode_with_schema：schema 段 + 数据段组装
+    var data = table_new_i64()
+    data = zd.concat(data, zd.encode_i64(42))           // id=42
+    data = zd.concat(data, zd.encode_string("hero"))    // name="hero"
+    data = zd.concat(data, zd.encode_f64(9.5))          // score=9.5
+    var assembled = zd_ext.encode_with_schema(data, names, tys)
+    var (an, at, anext) = zd_ext.decode_schema(assembled, 0)
+    check(eq_strs(an, names) && eq_bytes(at, tys), "encode_with_schema header decodes")
+    var body_tail = zd.slice(assembled, anext, len(assembled))
+    check(eq_bytes(body_tail, data), "encode_with_schema body tail = data")
+    // 数据段按 schema 逐字段解码到对象
+    var (idv, idn) = zd.decode_i64(assembled, anext)
+    var (nmv, nmn) = zd.decode_string(assembled, idn)
+    var (scv, scn) = zd.decode_f64(assembled, nmn)
+    check(idv == 42 && nmv == "hero" && scv == 9.5 && scn == len(assembled),
+        "schema'd body decodes to object fields (id,name,score)")
+
+    // ========== 6. 内容哈希一致性与篡改检测 ==========
+    // 已知向量：FNV-1a 64("a") = 0xaf63dc4c8601ec8c（二补码 -5808556873153909620）
+    var hash_a = table_new_i64()
+    table_push(hash_a, 0x61)
+    check(zd_ext.content_hash(hash_a) == -5808556873153909620, "content_hash FNV-1a64('a') known vector")
+    // 一致性：同输入同哈希
+    var hb1 = table_new_i64()
+    table_push(hb1, 0x01)
+    table_push(hb1, 0x02)
+    table_push(hb1, 0x03)
+    check(zd_ext.content_hash(hb1) == zd_ext.content_hash(hb1), "content_hash deterministic")
+    // 不同输入不同哈希
+    var hb2 = zd.slice(hb1, 0, 2)
+    check(zd_ext.content_hash(hb1) != zd_ext.content_hash(hb2), "content_hash differs on input")
+    // encode_with_hash / decode_hash_end
+    var hashed = zd_ext.encode_with_hash(hb1)
+    check(len(hashed) == len(hb1) + 8, "encode_with_hash appends 8 bytes")
+    var (hh, be) = zd_ext.decode_hash_end(hashed)
+    check(be == len(hb1), "decode_hash_end body_end == body len")
+    check(hh == zd_ext.content_hash(hb1), "decode_hash_end hash matches content_hash")
+    check(eq_bytes(zd.slice(hashed, 0, be), hb1), "decode_hash_end body intact")
+    // 篡改检测：改中间一字节 → 存储哈希 ≠ 重算哈希
+    var tampered = zd.slice(hashed, 0, len(hashed))
+    tampered[1] = tampered[1] ^ 0xFF
+    var (th, tbe) = zd_ext.decode_hash_end(tampered)
+    var tampered_body = zd.slice(tampered, 0, tbe)
+    check(th != zd_ext.content_hash(tampered_body), "tamper detection: stored hash != recomputed")
+    // 哈希段被篡改：末 8 字节改掉 → body 不变但 hash 不同
+    var hashed2 = zd_ext.encode_with_hash(hb1)
+    hashed2[len(hashed2) - 1] = hashed2[len(hashed2) - 1] ^ 0x01
+    var (hh2, be2) = zd_ext.decode_hash_end(hashed2)
+    check(be2 == len(hb1) && hh2 != zd_ext.content_hash(hb1), "tampered hash segment detected")
+    // 长度不足 8 → 错误哨兵
+    var (hs, hsn) = zd_ext.decode_hash_end([0x01, 0x02])
+    check(hsn == -1, "decode_hash_end rejects short input")
+
+    if fails == 0 {
+        println("PASS all")
+    } else {
+        println("FAIL total=" + to_string(fails))
+    }
+    println("done")
+}

@@ -9,6 +9,8 @@ type tie<logic>
 //   5. 多段文档：assemble/read 往返、**按类型查找不假设段序**、flags 自动置位
 //   6. 一致性门：非 v3 / bit5 未置 / crc 不符 / 段越界 → 确定性拒绝
 //   7. 文件往返：save_v3 / load_v3
+//   8. **schema 段**：schema_id（tsha1f n=48）+ 三态纪律 + 演进前置条件
+//      + **跨语言 KAT**（schema 段逐字节 == zd-java ZdSchema.encodeSegment）
 import "../src/zd.tie"
 import "../src/zd_v3.tie"
 
@@ -211,6 +213,102 @@ func main() {
     // 无 footer
     var (ok_nf, _, _, _, _) = zd_v3.read_index(mkbytes(50))
     check(!ok_nf, "无 footer → 拒绝")
+
+    // ---------- 8. schema 段（含跨语言 KAT） ----------
+    var sn = table_new_i64()
+    var ss = table_new_string()
+    var st = table_new_i64()
+    var sst = table_new_i64()
+    table_push(sn, 1); table_push(ss, "id");   table_push(st, 0); table_push(sst, 0)
+    table_push(sn, 2); table_push(ss, "name"); table_push(st, 2); table_push(sst, 0)
+    check(zd_v3.schema_validate(sn, ss, st, sst), "schema 纪律校验通过")
+
+    // schema_id：tsha1f(n=48, base=48)，48 字符
+    var sid = zd_v3.schema_id(sn, ss, st, sst)
+    check(str_len(sid) == 48, "schema_id 长度 48（base-48）")
+
+    // **跨语言 KAT**：与 zd-java ZdSchema 的 id 逐字一致
+    check(sid == "2dtwvJBb5dojkiHKmKtmpbfhhcseDpLF9141ldgzF8Csdsl0",
+        "schema_id == zd-java（跨语言 KAT）")
+
+    // schema 段：字节长度与逐字节 KAT（zd-java encodeSegment hex）
+    var sseg = zd_v3.encode_schema(sn, ss, st, sst)
+    check(len(sseg) == 114, "schema 段长度 114 == zd-java")
+    var kat_hex = "82a26964d93032647477764a426235646f6a6b69484b6d4b746d706266686863736544704c46393134316c64677a4638437364736c30" +
+        "a66669656c64739284a36e756d01a46e616d65a26964a2747900a573746174650084a36e756d02a46e616d65a46e616d65a2747902a5737461746500"
+    var hexdig: string = "0123456789abcdef"
+    var got_hex: string = ""
+    var hi: i64 = 0
+    while hi < len(sseg) {
+        var bb = sseg[hi] & 0xFF
+        got_hex = got_hex + str_char(hexdig, bb >> 4) + str_char(hexdig, bb & 0xF)
+        hi = hi + 1
+    }
+    check(got_hex == kat_hex, "schema 段逐字节 == zd-java encodeSegment（跨语言 KAT）")
+
+    // 解码往返（自定界：next == 段长）+ 段内 id 自洽门
+    var (sok, sdn, sds, sdt, sdst, snx) = zd_v3.decode_schema(sseg, 0)
+    check(sok, "schema 段解码 ok")
+    check(snx == len(sseg), "自定界：next == 段长")
+    check(len(sdn) == 2 && sds[0] == "id" && sds[1] == "name", "字段名往返")
+    check(sdt[1] == 2 && sdst[0] == 0, "类型/状态往返")
+    // 篡改 id → 自洽门拒绝
+    var sbad = zd.slice(sseg, 0, len(sseg))
+    sbad[7] = 0x30
+    var (bok, _, _, _, _, _) = zd_v3.decode_schema(sbad, 0)
+    check(!bok, "段内 id 被篡改 → 自洽门拒绝")
+
+    // 字段三态纪律
+    check(zd_v3.schema_allows_write(zd_v3.schema_state_active()), "active 允许写")
+    check(!zd_v3.schema_allows_write(zd_v3.schema_state_deprecated()), "deprecated 禁止新写")
+    check(zd_v3.schema_readable(zd_v3.schema_state_active()) &&
+          zd_v3.schema_readable(zd_v3.schema_state_deprecated()), "active/deprecated 都可读")
+    check(!zd_v3.schema_readable(zd_v3.schema_state_removed()), "removed 不可读")
+    // 演进：active → deprecated → removed；跳步拒绝
+    var (e1, st1) = zd_v3.schema_evolve(sst, 0, 1)
+    check(e1 && st1[0] == 1, "active → deprecated 允许")
+    var (e2, st2) = zd_v3.schema_evolve(st1, 0, 2)
+    check(e2 && st2[0] == 2, "deprecated → removed 允许")
+    var (e3, _) = zd_v3.schema_evolve(sst, 0, 2)
+    check(!e3, "active 直接 → removed 拒绝（须经一个版本周期）")
+    var (e4, _) = zd_v3.schema_evolve(st2, 0, 1)
+    check(!e4, "removed 再 deprecate 拒绝")
+
+    // 纪律拒绝：编号重复 / 非升序 / ty 越界 / state 越界
+    var dup = table_new_i64()
+    var dups = table_new_string()
+    var dupt = table_new_i64()
+    var dupst = table_new_i64()
+    table_push(dup, 1); table_push(dups, "a"); table_push(dupt, 0); table_push(dupst, 0)
+    table_push(dup, 1); table_push(dups, "b"); table_push(dupt, 0); table_push(dupst, 0)
+    check(!zd_v3.schema_validate(dup, dups, dupt, dupst), "编号重复 → 拒绝")
+    var uns = table_new_i64()
+    var unss = table_new_string()
+    var unst = table_new_i64()
+    var unsst = table_new_i64()
+    table_push(uns, 2); table_push(unss, "a"); table_push(unst, 0); table_push(unsst, 0)
+    table_push(uns, 1); table_push(unss, "b"); table_push(unst, 0); table_push(unsst, 0)
+    check(!zd_v3.schema_validate(uns, unss, unst, unsst), "编号非升序 → 拒绝")
+    var bty = table_new_i64()
+    var btys = table_new_string()
+    var btyt = table_new_i64()
+    var btyst = table_new_i64()
+    table_push(bty, 1); table_push(btys, "a"); table_push(btyt, 9); table_push(btyst, 0)
+    check(!zd_v3.schema_validate(bty, btys, btyt, btyst), "ty 越界(9) → 拒绝")
+    var bst = table_new_i64()
+    var bsts = table_new_string()
+    var bstt = table_new_i64()
+    var bstst = table_new_i64()
+    table_push(bst, 1); table_push(bsts, "a"); table_push(bstt, 0); table_push(bstst, 3)
+    check(!zd_v3.schema_validate(bst, bsts, bstt, bstst), "state 越界(3) → 拒绝")
+    // 空 schema（0 字段）合法且 id 稳定
+    var en = table_new_i64()
+    var es_ = table_new_string()
+    var et = table_new_i64()
+    var est = table_new_i64()
+    var eid1 = zd_v3.schema_id(en, es_, et, est)
+    var eid2 = zd_v3.schema_id(en, es_, et, est)
+    check(str_len(eid1) == 48 && eid1 == eid2, "空 schema 合法且 id 稳定")
 
     // ---------- 7. 文件往返 ----------
     var path = work + "_v3.zd"

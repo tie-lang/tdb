@@ -920,6 +920,292 @@ pub func std_tag_of(ext: table<i64>) -> i64 {
     return tag
 }
 
+// ==================== 图容器（段类型 4 / ext 标记 0x47） ====================
+// 对齐 zd-java ZdGraph（设计案 §6）。**紧凑形态**：
+//   [声明 1B][节点数 varint][节点表][边数 varint][边表]
+//   声明位：bit0 有向；bit1 节点 id 形态（0 = varint 索引 / 1 = string 显式 id）；
+//           bit2 列式承载（本实现未覆盖，见下「未覆盖面」）。
+//   节点 = [id][载荷标志 1B][属性标志 1B]（本实现承载「无载荷无属性」形态：
+//           两标志恒 0x00 —— 载荷/属性为「zd 值嵌入形态」，依赖 tdata 树展平子系统）
+//   边   = [from varint][to varint][边头 1B][有向覆盖字节（可选）]
+//          [标签 string（可选）][权重 8 字节大端裸位模式（可选，**不带 0xCB 标记**）]
+//   边头位：bit0 有向覆盖（置位时**另写 1 字节**承载 0/1）；bit1 有标签；
+//           bit2 有权重；bit3 有属性。
+// 约束：节点 id 唯一；边的 from/to 必须指向存在节点（**编解码双侧校验**）；
+//       自环与多重边合法；空图（0 节点 0 边）合法。
+// **未覆盖面（明确边界，后续随 tdata 树展平落地）**：载荷/属性嵌入形态（ZdTrees
+//   的 varint 行数 + 六字段 wire2 记录）、列式承载形态（声明 bit2）。
+//   本实现遇到载荷/属性标志置位或声明 bit2 时**确定性拒绝**，不静默降级。
+
+pub func graph_decl_directed() -> i64 { return 1 }
+pub func graph_decl_string_ids() -> i64 { return 2 }
+pub func graph_decl_columnar() -> i64 { return 4 }
+pub func graph_edge_directed_override() -> i64 { return 1 }
+pub func graph_edge_has_label() -> i64 { return 2 }
+pub func graph_edge_has_weight() -> i64 { return 4 }
+pub func graph_edge_has_attrs() -> i64 { return 8 }
+
+// graph_encode：紧凑形态编码。id 形态按 string_ids 取 str_ids 或 idx_ids。
+//   e_dir: 每边的有向覆盖值（仅 e_dir_present[i] == 1 时写入；否则该边无覆盖）。
+// 拒绝（空表）：节点数/边数三表长度不等；string_ids 时 str_ids 长度不符；
+//   节点 id 重复；边端点越界；e_dir_present 长度不符。
+pub func graph_encode(directed: bool, string_ids: bool,
+                      idx_ids: table<i64>, str_ids: table<string>,
+                      e_from: table<i64>, e_to: table<i64>,
+                      e_dir_present: table<i64>, e_dir: table<i64>,
+                      e_labels: table<string>, e_weights: table<f64>) -> table<i64> {
+    var nn: i64 = len(idx_ids)
+    var ne: i64 = len(e_from)
+    if string_ids {
+        nn = len(str_ids)
+    }
+    // 只校验**启用侧**的 id 表长度：另一侧表可空（调用方只填用到的那张）。
+    if string_ids {
+        if len(str_ids) != nn {
+            return table_new_i64()
+        }
+    } else {
+        if len(idx_ids) != nn {
+            return table_new_i64()
+        }
+    }
+    if len(e_to) != ne || len(e_dir_present) != ne || len(e_dir) != ne ||
+        len(e_labels) != ne || len(e_weights) != ne {
+        return table_new_i64()
+    }
+    // 节点 id 唯一性
+    var i: i64 = 0
+    while i < nn {
+        var j: i64 = i + 1
+        while j < nn {
+            if string_ids {
+                if str_ids[i] == str_ids[j] {
+                    return table_new_i64()
+                }
+            } else {
+                if idx_ids[i] == idx_ids[j] {
+                    return table_new_i64()
+                }
+            }
+            j = j + 1
+        }
+        i = i + 1
+    }
+    // 边端点必须指向存在节点
+    i = 0
+    while i < ne {
+        if e_from[i] < 0 || e_from[i] >= nn || e_to[i] < 0 || e_to[i] >= nn {
+            return table_new_i64()
+        }
+        i = i + 1
+    }
+    var decl: i64 = 0
+    if directed {
+        decl = decl | 1
+    }
+    if string_ids {
+        decl = decl | 2
+    }
+    var out: table<i64> = [decl]
+    out = zd.concat(out, zd.write_varint(nn))
+    i = 0
+    while i < nn {
+        if string_ids {
+            out = zd.concat(out, zd.encode_string(str_ids[i]))
+        } else {
+            out = zd.concat(out, zd.write_varint(idx_ids[i]))
+        }
+        out = zd.concat(out, [0x00])   // 载荷标志：无
+        out = zd.concat(out, [0x00])   // 属性标志：无
+        i = i + 1
+    }
+    out = zd.concat(out, zd.write_varint(ne))
+    i = 0
+    while i < ne {
+        out = zd.concat(out, zd.write_varint(e_from[i]))
+        out = zd.concat(out, zd.write_varint(e_to[i]))
+        var head: i64 = 0
+        if e_dir_present[i] == 1 {
+            head = head | 1
+        }
+        if str_len(e_labels[i]) > 0 {
+            head = head | 2
+        }
+        // 权重：以 -0.0 之外的值判定「有」不可行（0.0 合法），故用独立标志不可得——
+        // 约定：权重恒写入（e_weights 长度已校验），head bit2 恒置位。
+        head = head | 4
+        out = zd.concat(out, [head])
+        if e_dir_present[i] == 1 {
+            if e_dir[i] == 1 {
+                out = zd.concat(out, [1])
+            } else {
+                out = zd.concat(out, [0])
+            }
+        }
+        if str_len(e_labels[i]) > 0 {
+            out = zd.concat(out, zd.encode_string(e_labels[i]))
+        }
+        var wb = bitcast_f64_i64(e_weights[i])
+        out = zd.concat(out, [(wb >> 56) & 0xFF, (wb >> 48) & 0xFF, (wb >> 40) & 0xFF,
+            (wb >> 32) & 0xFF, (wb >> 24) & 0xFF, (wb >> 16) & 0xFF, (wb >> 8) & 0xFF, wb & 0xFF])
+        i = i + 1
+    }
+    return out
+}
+
+// graph_decode_open：读声明 + 节点数/边数 + 节点表（不含边表）。
+//   → (ok, decl, string_ids, idx_ids, str_ids, nn, ne, p_edges)。
+//   **p_edges = 首条边的起点**（即 ne 之后的位置），与 graph_decode_edges 的入参一致。
+// 拒绝（ok=false）：声明 bit2（列式形态，未覆盖）；载荷/属性标志置位；节点 id 重复。
+// **拆分为三段**（open / edges）而非单个大函数：既让调用方可在需要时只读头部，
+// 也避免单函数承载两套循环 + 11 值返回的复杂度。
+pub func graph_decode_open(b: table<i64>, pos: i64) -> (bool, i64, bool, table<i64>, table<string>, i64, i64, i64) {
+    var no_t = table_new_i64()
+    var no_s = table_new_string()
+    var decl = zd.u8_at(b, pos)
+    if decl < 0 {
+        return (false, 0, false, no_t, no_s, 0, 0, -1)
+    }
+    if (decl & 4) != 0 {
+        return (false, 0, false, no_t, no_s, 0, 0, -1)   // 列式形态未覆盖
+    }
+    var string_ids: bool = (decl & 2) != 0
+    var (nn, p1) = zd.read_varint(b, pos + 1)
+    if p1 < 0 || nn < 0 {
+        return (false, 0, false, no_t, no_s, 0, 0, -1)
+    }
+    var idx_ids = table_new_i64()
+    var str_ids = table_new_string()
+    var p: i64 = p1
+    var i: i64 = 0
+    while i < nn {
+        if string_ids {
+            var (sid, p2) = zd.decode_string(b, p)
+            if p2 < 0 {
+                return (false, 0, false, no_t, no_s, 0, 0, -1)
+            }
+            table_push(str_ids, sid)
+            p = p2
+        } else {
+            var (iid, p2) = zd.read_varint(b, p)
+            if p2 < 0 {
+                return (false, 0, false, no_t, no_s, 0, 0, -1)
+            }
+            table_push(idx_ids, iid)
+            p = p2
+        }
+        var pf = zd.u8_at(b, p)
+        var af = zd.u8_at(b, p + 1)
+        if pf != 0 || af != 0 {
+            return (false, 0, false, no_t, no_s, 0, 0, -1)   // 载荷/属性嵌入未覆盖
+        }
+        p = p + 2
+        i = i + 1
+    }
+    // 节点 id 唯一
+    i = 0
+    while i < nn {
+        var j: i64 = i + 1
+        while j < nn {
+            if string_ids {
+                if str_ids[i] == str_ids[j] {
+                    return (false, 0, false, no_t, no_s, 0, 0, -1)
+                }
+            } else {
+                if idx_ids[i] == idx_ids[j] {
+                    return (false, 0, false, no_t, no_s, 0, 0, -1)
+                }
+            }
+            j = j + 1
+        }
+        i = i + 1
+    }
+    var (ne, p3) = zd.read_varint(b, p)
+    if p3 < 0 || ne < 0 {
+        return (false, 0, false, no_t, no_s, 0, 0, -1)
+    }
+    return (true, decl, string_ids, idx_ids, str_ids, nn, ne, p3)
+}
+
+// graph_decode_edges：读边表 → (ok, next)，结果写入**调用方预建的 out 表**。
+//   入参 (b, p_edges, nn, ne)：p_edges = **首条边的起点**（= ne 之后的位置，由
+//   graph_decode_open 返回），ne = 边数（同 open 返回，避免此处重读）。
+//   e_dir：2 = 无有向覆盖 / 0 或 1 = 覆盖值。
+//   e_weight_bits：权重**裸 8 字节大端位模式**（与线格式一致；调用方按需
+//   bitcast_i64_f64 还原为 f64）。
+// 拒绝（ok=false）：边头 bit3（属性，未覆盖）；端点越界；有向覆盖字节非 0/1；字节不足。
+// **接口形态的两处刻意选择（均实测驱动）**：
+//   1. 「ref 出参 + 2 值返回」而非「六张表的多值返回」——后者在本编译器上生成崩溃
+//      代码（同逻辑内联在 main 里完全正常，缩为 2 值返回即恢复）。
+//   2. 权重用 `ref table<i64>` 承载裸位模式，**不用 `ref table<f64>`**——后者同样触发
+//      崩溃；且线与内存本就存裸位模式，这样反而与线格式一致、少一次转换。
+// ref 出参另有两个好处：调用方可复用/预分配输出表（省分配），失败时无需返回空表。
+pub func graph_decode_edges(b: table<i64>, p_edges: i64, nn: i64, ne: i64,
+                            e_from: ref table<i64>, e_to: ref table<i64>,
+                            e_head: ref table<i64>, e_dir: ref table<i64>,
+                            e_labels: ref table<string>, e_weight_bits: ref table<i64>) -> (bool, i64) {
+    if ne < 0 {
+        return (false, -1)
+    }
+    var p: i64 = p_edges
+    var i: i64 = 0
+    while i < ne {
+        var (fr, q1) = zd.read_varint(b, p)
+        if q1 < 0 {
+            return (false, -1)
+        }
+        var (to, q2) = zd.read_varint(b, q1)
+        if q2 < 0 {
+            return (false, -1)
+        }
+        var head = zd.u8_at(b, q2)
+        if head < 0 || (head & 8) != 0 {
+            return (false, -1)   // 属性嵌入未覆盖
+        }
+        if fr < 0 || fr >= nn || to < 0 || to >= nn {
+            return (false, -1)   // 端点越界（解码侧校验）
+        }
+        var q: i64 = q2 + 1
+        var dv: i64 = 2
+        if (head & 1) != 0 {
+            var ov = zd.u8_at(b, q)
+            if ov < 0 || ov > 1 {
+                return (false, -1)
+            }
+            dv = ov
+            q = q + 1
+        }
+        var lab = ""
+        if (head & 2) != 0 {
+            var (ls, q3) = zd.decode_string(b, q)
+            if q3 < 0 {
+                return (false, -1)
+            }
+            lab = ls
+            q = q3
+        }
+        var bits: i64 = 0
+        if (head & 4) != 0 {
+            // 权重是**裸 8 字节大端**（zd-java ZdPrimitives.be64），不带 0xCB 标记。
+            var (vbits, q4) = zd.read_u64_be(b, q)
+            if q4 < 0 {
+                return (false, -1)
+            }
+            bits = vbits
+            q = q4
+        }
+        table_push(e_from, fr)
+        table_push(e_to, to)
+        table_push(e_head, head)
+        table_push(e_dir, dv)
+        table_push(e_labels, lab)
+        table_push(e_weight_bits, bits)
+        p = q
+        i = i + 1
+    }
+    return (true, p)
+}
+
 // ---------- 文件接口（v3，禁写 v1） ----------
 
 // save_v3：单段数据体文件（段类型 0）→ 路径。成功 true。

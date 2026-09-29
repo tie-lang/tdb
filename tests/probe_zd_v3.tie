@@ -11,6 +11,7 @@ type tie<logic>
 //   7. 文件往返：save_v3 / load_v3
 //   8. **schema 段**：schema_id（tsha1f n=48）+ 三态纪律 + 演进前置条件
 //      + **跨语言 KAT**（schema 段逐字节 == zd-java ZdSchema.encodeSegment）
+//   9. **标准类型三件**：timestamp(1) / decimal(2) / uuid(3)，含跨语言 KAT 与越界拒绝
 import "../src/zd.tie"
 import "../src/zd_v3.tie"
 
@@ -309,6 +310,65 @@ func main() {
     var eid1 = zd_v3.schema_id(en, es_, et, est)
     var eid2 = zd_v3.schema_id(en, es_, et, est)
     check(str_len(eid1) == 48 && eid1 == eid2, "空 schema 合法且 id 稳定")
+
+    // ---------- 9. 标准类型三件（ext 固定标记；含跨语言 KAT） ----------
+    var hexd2: string = "0123456789abcdef"
+
+    // timestamp（标记 1）：8 字节秒 + 4 字节纳秒
+    var ts = zd_v3.encode_timestamp(1700000000, 123456789)
+    var ts_hex: string = ""
+    var ti: i64 = 0
+    while ti < len(ts) {
+        var tb = ts[ti] & 0xFF
+        ts_hex = ts_hex + str_char(hexd2, tb >> 4) + str_char(hexd2, tb & 0xF)
+        ti = ti + 1
+    }
+    check(ts_hex == "d7010c000000006553f100075bcd15", "timestamp 逐字节 == zd-java（KAT）")
+    var (tsok, tssec, tsnano) = zd_v3.decode_timestamp(ts)
+    check(tsok && tssec == 1700000000 && tsnano == 123456789, "timestamp 往返")
+    check(zd_v3.std_tag_of(ts) == 1, "timestamp 标记 = 1")
+    check(len(zd_v3.encode_timestamp(0, 999999999)) > 0, "纳秒上界 999999999 接受")
+    check(len(zd_v3.encode_timestamp(0, 1000000000)) == 0, "纳秒越界 1e9 → 拒绝")
+    check(len(zd_v3.encode_timestamp(0, 0 - 1)) == 0, "纳秒负值 → 拒绝")
+
+    // decimal（标记 2）：[符号][指数 i8][数字串]
+    var dec = zd_v3.encode_decimal(true, 0 - 3, "12345")
+    var dec_hex: string = ""
+    var di: i64 = 0
+    while di < len(dec) {
+        var db = dec[di] & 0xFF
+        dec_hex = dec_hex + str_char(hexd2, db >> 4) + str_char(hexd2, db & 0xF)
+        di = di + 1
+    }
+    check(dec_hex == "d7020701fd3132333435", "decimal 逐字节 == zd-java（KAT）")
+    var (dok, dneg, dexp, ddig) = zd_v3.decode_decimal(dec)
+    check(dok && dneg && dexp == 0 - 3 && ddig == "12345", "decimal 往返（负号/指数/数字）")
+    check(zd_v3.std_tag_of(dec) == 2, "decimal 标记 = 2")
+    check(len(zd_v3.encode_decimal(false, 0, "0")) > 0, "decimal 单字符 0 接受")
+    check(len(zd_v3.encode_decimal(false, 0, "12a")) == 0, "decimal 含非数字 → 拒绝")
+    check(len(zd_v3.encode_decimal(false, 0, "")) == 0, "decimal 空数字串 → 拒绝")
+    check(len(zd_v3.encode_decimal(false, 128, "1")) == 0, "decimal 指数 128 越界 → 拒绝")
+    check(len(zd_v3.encode_decimal(false, 0 - 129, "1")) == 0, "decimal 指数 -129 越界 → 拒绝")
+    check(len(zd_v3.encode_decimal(false, 127, "1")) > 0, "decimal 指数 +127 接受")
+
+    // uuid（标记 3）：16 字节
+    var uu = zd_v3.encode_uuid(0x0102030405060708, 0x1112131415161718)
+    var uu_hex: string = ""
+    var ui: i64 = 0
+    while ui < len(uu) {
+        var ub = uu[ui] & 0xFF
+        uu_hex = uu_hex + str_char(hexd2, ub >> 4) + str_char(hexd2, ub & 0xF)
+        ui = ui + 1
+    }
+    check(uu_hex == "d7031001020304050607081112131415161718", "uuid 逐字节 == zd-java（KAT）")
+    var (uok, umsb, ulsb) = zd_v3.decode_uuid(uu)
+    check(uok && umsb == 0x0102030405060708 && ulsb == 0x1112131415161718, "uuid 往返")
+    check(zd_v3.std_tag_of(uu) == 3, "uuid 标记 = 3")
+    // 标记不符 → 拒绝（用 timestamp 的字节按 uuid 解）
+    var (bad_u, _, _) = zd_v3.decode_uuid(ts)
+    check(!bad_u, "标记不符（timestamp 按 uuid 解）→ 拒绝")
+    // 图容器标记常量
+    check(zd_v3.std_tag_graph() == 0x47, "图容器 ext 标记 = 0x47")
 
     // ---------- 7. 文件往返 ----------
     var path = work + "_v3.zd"

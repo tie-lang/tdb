@@ -1,0 +1,275 @@
+type tie<logic>
+// probe_zd_perf: zd 性能基准（差值法：减去 ~700ms 运行时固定启动成本）
+// ============================================================================
+// 用法 / usage:  probe_zd_perf.exe <case> <scale> <repeat>
+//   外部计时；单次成本 ≈ (T(repeat=2) − T(repeat=1))（差值扣除固定启动成本）。
+//   Timed externally; per-run cost ≈ (T(rep=2) − T(rep=1)).
+//   数据构造在 main 内一次完成，测项在 do_case 内重复 repeat 次。
+//   Data construction happens once in main; the case body repeats `repeat` times.
+//
+// case（scale 含义 / meaning of scale）:
+//   noop      空 / nothing (固定成本基线 / fixed-cost baseline)
+//   slice     zd.slice 拷贝 scale 字节
+//   encbytes  zd.encode_bytes(scale 字节)
+//   decbytes  encode_bytes + decode_bytes
+//   encstr    scale 次 encode_string(定长串) / scale encodes of a fixed string
+//   decstr    decode_string(长度 scale 的串) / one decode of a scale-length string
+//   encarr    encode_string_array(scale 个串，元素复用)
+//   encrec    scale 次 encode_field(1,2,encode_string(...))
+//   f64enc    scale 次 encode_f64
+//   f64dec    scale 次 decode_f64（先 encode_f64_array）
+//   poolbuild pool_build(scale 个串)
+//   poolidx   pool_build(scale) 后 scale 次 pool_index
+//   col       encode_columnar(3 列 × scale 行)
+//   crc       zd_stream.crc32(scale 字节)
+//   chunk     zd_stream.chunk_encode(scale 字节)
+//   offtab    encode_with_offsets(scale 项)
+
+import "../src/zd.tie"
+import "../src/zd_extra.tie"
+import "../src/zd_ext.tie"
+import "../src/zd_stream.tie"
+import "../src/zd_builder.tie"
+
+// ---------- 全局数据（main 构造，do_case 消费） ----------
+var g_raw: table<i64>
+var g_i64: table<i64>
+var g_f64: table<f64>
+var g_strs: table<string>
+var g_longenc: table<i64>
+var g_acc: i64 = 0
+
+func mkbytes(n: i64) -> table<i64> {
+    var t = table_new_i64()
+    var i: i64 = 0
+    while i < n {
+        table_push(t, i & 0xFF)
+        i = i + 1
+    }
+    return t
+}
+
+func mkstr(l: i64) -> string {
+    var m: i64 = l
+    if m > 8192 {
+        m = 8192
+    }
+    var s: string = ""
+    var i: i64 = 0
+    while i < m {
+        s = s + "a"
+        i = i + 1
+    }
+    return s
+}
+
+// mkstrs：n 个短串（仅 200 个唯一值，控制唯一串总量以护住静态池）。
+func mkstrs(n: i64) -> table<string> {
+    var m: i64 = n
+    if m > 2000 {
+        m = 2000
+    }
+    var t = table_new_string()
+    var i: i64 = 0
+    while i < m {
+        table_push(t, "key" + to_string(i % 200))
+        i = i + 1
+    }
+    return t
+}
+
+func mki64(n: i64) -> table<i64> {
+    var t = table_new_i64()
+    var i: i64 = 0
+    while i < n {
+        table_push(t, i)
+        i = i + 1
+    }
+    return t
+}
+
+func mkf64(n: i64) -> table<f64> {
+    var t = table_new_f64()
+    var x: f64 = 1.5
+    var i: i64 = 0
+    while i < n {
+        table_push(t, x)
+        x = x + 0.25
+        if x > 30.0 {
+            x = 1.5
+        }
+        i = i + 1
+    }
+    return t
+}
+
+// do_case：执行一次测项，返回可累加的量（防 DCE）。
+func do_case(cs: string, n: i64) -> i64 {
+    if cs == "noop" {
+        return 1
+    }
+    if cs == "slice" {
+        var c = zd.slice(g_raw, 0, len(g_raw))
+        return len(c)
+    }
+    if cs == "encbytes" {
+        var e = zd.encode_bytes(g_raw)
+        return len(e)
+    }
+    if cs == "decbytes" {
+        var e2 = zd.encode_bytes(g_raw)
+        var (d, p) = zd.decode_bytes(e2, 0)
+        return len(d) + p
+    }
+    if cs == "encstr" {
+        var tot: i64 = 0
+        var k: i64 = 0
+        while k < n {
+            tot = tot + len(zd.encode_string("hello-world-0123456789"))
+            k = k + 1
+        }
+        return tot
+    }
+    if cs == "decstr" {
+        var (ds, dp) = zd.decode_string(g_longenc, 0)
+        return str_len(ds) + dp
+    }
+    if cs == "encarr" {
+        var a = zd.encode_string_array(g_strs)
+        return len(a)
+    }
+    if cs == "encrec" {
+        var tot2: i64 = 0
+        var k2: i64 = 0
+        while k2 < n {
+            tot2 = tot2 + len(zd.encode_field(1, 2, zd.encode_string("key123")))
+            k2 = k2 + 1
+        }
+        return tot2
+    }
+    if cs == "f64enc" {
+        var tot3: i64 = 0
+        var k3: i64 = 0
+        while k3 < n {
+            tot3 = tot3 + len(zd.encode_f64(g_f64[k3 % len(g_f64)]))
+            k3 = k3 + 1
+        }
+        return tot3
+    }
+    if cs == "f64dec" {
+        var enc = zd.encode_f64_array(g_f64)
+        var tot4: i64 = 0
+        var k4: i64 = 0
+        while k4 < n {
+            var (v, p3) = zd.decode_f64(enc, 1)
+            tot4 = tot4 + p3
+            k4 = k4 + 1
+        }
+        return tot4
+    }
+    if cs == "poolbuild" {
+        var pool = zd_extra.pool_build(g_strs)
+        return len(pool)
+    }
+    if cs == "poolidx" {
+        var pool2 = zd_extra.pool_build(g_strs)
+        var hit: i64 = 0
+        var k5: i64 = 0
+        while k5 < n {
+            hit = hit + zd_extra.pool_index(pool2, "key" + to_string(k5 % 200))
+            k5 = k5 + 1
+        }
+        return hit + len(pool2)
+    }
+    if cs == "poolhash" {
+        var pl = zd_extra.pool_build(g_strs)
+        var (bk, od, st) = zd_extra.pool_index_build(pl)
+        var hit2: i64 = 0
+        var k9: i64 = 0
+        while k9 < n {
+            hit2 = hit2 + zd_extra.pool_lookup(pl, bk, od, st, "key" + to_string(k9 % 200))
+            k9 = k9 + 1
+        }
+        return hit2 + len(pl)
+    }
+    if cs == "poolhashbuild" {
+        var pl2 = zd_extra.pool_build(g_strs)
+        var (bk2, od2, st2) = zd_extra.pool_index_build(pl2)
+        return len(bk2) + len(od2) + len(st2) + len(pl2)
+    }
+    if cs == "col" {
+        var cols: table<table> = []
+        table_push(cols, g_i64)
+        table_push(cols, g_strs)
+        table_push(cols, g_f64)
+        var tys = table_new_i64()
+        table_push(tys, 0)
+        table_push(tys, 2)
+        table_push(tys, 1)
+        var e4 = zd_extra.encode_columnar(3, tys, cols)
+        return len(e4)
+    }
+    if cs == "readloop" {
+        var acc: i64 = 0
+        var j: i64 = 0
+        while j < n {
+            acc = acc + g_raw[j]
+            j = j + 1
+        }
+        return acc
+    }
+    if cs == "pushloop" {
+        var t = table_new_i64()
+        var j2: i64 = 0
+        while j2 < n {
+            table_push(t, j2 & 0xFF)
+            j2 = j2 + 1
+        }
+        return len(t)
+    }
+    if cs == "crc" {
+        return zd_stream.crc32(g_raw)
+    }
+    if cs == "chunk" {
+        var e5 = zd_stream.chunk_encode(g_raw)
+        return len(e5)
+    }
+    if cs == "offtab" {
+        var e6 = zd_extra.encode_with_offsets(g_i64, 8)
+        return len(e6)
+    }
+    return -1
+}
+
+func main() {
+    var argc: i64 = arg_count()
+    var cs: string = "noop"
+    if argc >= 1 {
+        cs = arg_string(0)
+    }
+    var n: i64 = 10000
+    if argc >= 2 {
+        n = parse_int(arg_string(1))
+    }
+    var rep: i64 = 1
+    if argc >= 3 {
+        rep = parse_int(arg_string(2))
+    }
+
+    // 构造（一次）
+    g_raw = mkbytes(n)
+    g_i64 = mki64(n)
+    g_f64 = mkf64(n)
+    g_strs = mkstrs(n)
+    var longstr = mkstr(n)
+    g_longenc = zd.encode_string(longstr)
+    g_acc = g_acc + len(g_raw) + len(g_i64) + len(g_f64) + len(g_strs) + len(g_longenc)
+
+    // 测项（repeat 次）
+    var r: i64 = 0
+    while r < rep {
+        g_acc = g_acc + do_case(cs, n)
+        r = r + 1
+    }
+    println("sink=" + to_string(g_acc))
+}

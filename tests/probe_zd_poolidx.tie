@@ -1,0 +1,102 @@
+type tie<logic>
+// probe_zd_poolidx: 池哈希索引（p.9.6.2 性能）——正确性 + 与线性 pool_index 语义一致
+import "../src/zd.tie"
+import "../src/zd_extra.tie"
+
+var fails: i64 = 0
+
+func check(cond: bool, msg: string) {
+    if cond {
+        println("PASS " + msg)
+    } else {
+        println("FAIL " + msg)
+        fails = fails + 1
+    }
+}
+
+func main() {
+    // 池：300 条（200 唯一 + 100 重复），覆盖 fixstr / str8 / str16 三种头形态
+    var strs = table_new_string()
+    var i: i64 = 0
+    while i < 200 {
+        table_push(strs, "k" + to_string(i))
+        i = i + 1
+    }
+    // 长串（>31 字节 → str8）
+    i = 0
+    while i < 50 {
+        var s: string = "long-"
+        var j: i64 = 0
+        while j < 40 {
+            s = s + "x"
+            j = j + 1
+        }
+        table_push(strs, s + to_string(i))
+        i = i + 1
+    }
+    // 重复串（与前面同值，验证 pool 序号指向首个）
+    i = 0
+    while i < 50 {
+        table_push(strs, "k" + to_string(i))
+        i = i + 1
+    }
+    var pool = zd_extra.pool_build(strs)
+    var (buckets, ords, starts) = zd_extra.pool_index_build(pool)
+    check(len(starts) == 300, "索引覆盖全部 300 条目（实际 " + to_string(len(starts)) + "）")
+
+    // 命中：全部唯一串逐一对照线性 pool_index
+    var ok: bool = true
+    i = 0
+    while i < 200 {
+        var q = "k" + to_string(i)
+        var a = zd_extra.pool_index(pool, q)
+        var b = zd_extra.pool_lookup(pool, buckets, ords, starts, q)
+        if a != b {
+            ok = false
+        }
+        i = i + 1
+    }
+    check(ok, "200 条唯一短串：哈希查询 == 线性查询（命中）")
+
+    // 长串（str8 头形态）
+    ok = true
+    i = 0
+    while i < 50 {
+        var s2: string = "long-"
+        var j2: i64 = 0
+        while j2 < 40 {
+            s2 = s2 + "x"
+            j2 = j2 + 1
+        }
+        var q2 = s2 + to_string(i)
+        if zd_extra.pool_index(pool, q2) != zd_extra.pool_lookup(pool, buckets, ords, starts, q2) {
+            ok = false
+        }
+        i = i + 1
+    }
+    check(ok, "50 条长串（str8 头）：哈希查询 == 线性查询")
+
+    // 未命中：不与任何前缀/超串误判
+    var m1 = zd_extra.pool_lookup(pool, buckets, ords, starts, "k99999")
+    var m2 = zd_extra.pool_lookup(pool, buckets, ords, starts, "k")
+    var m3 = zd_extra.pool_lookup(pool, buckets, ords, starts, "k1x")
+    var m4 = zd_extra.pool_lookup(pool, buckets, ords, starts, "")
+    check(m1 == -1 && m2 == -1 && m3 == -1, "未命中返回 -1（不误判前缀/超串/异串）")
+    check(m4 == -1 && zd_extra.pool_index(pool, "") == -1, "空串未命中（与线性一致）")
+
+    // 重复串：池序号应等于线性查询结果（首个匹配）
+    var r0 = zd_extra.pool_lookup(pool, buckets, ords, starts, "k7")
+    check(r0 == zd_extra.pool_index(pool, "k7"), "重复串取池内首个序号（与线性一致）")
+
+    // 空池
+    var ep = zd_extra.pool_build(table_new_string())
+    var (eb, eo, es) = zd_extra.pool_index_build(ep)
+    check(zd_extra.pool_lookup(ep, eb, eo, es, "x") == -1, "空池查询 -1")
+
+    if fails == 0 {
+        println("PASS all")
+    } else {
+        println("FAIL total=" + to_string(fails))
+    }
+    println("done")
+}

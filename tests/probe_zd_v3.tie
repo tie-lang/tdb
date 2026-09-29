@@ -12,7 +12,9 @@ type tie<logic>
 //   8. **schema 段**：schema_id（tsha1f n=48）+ 三态纪律 + 演进前置条件
 //      + **跨语言 KAT**（schema 段逐字节 == zd-java ZdSchema.encodeSegment）
 //   9. **标准类型三件**：timestamp(1) / decimal(2) / uuid(3)，含跨语言 KAT 与越界拒绝
+//  10. **图容器紧凑形态**：声明位 / 节点表 / 边表 / 约束双侧校验 / 跨语言 KAT
 import "../src/zd.tie"
+import "../src/zd_ext.tie"
 import "../src/zd_v3.tie"
 
 var fails: i64 = 0
@@ -369,6 +371,152 @@ func main() {
     check(!bad_u, "标记不符（timestamp 按 uuid 解）→ 拒绝")
     // 图容器标记常量
     check(zd_v3.std_tag_graph() == 0x47, "图容器 ext 标记 = 0x47")
+
+    // ---------- 10. 图容器紧凑形态（含跨语言 KAT） ----------
+    var hexd3: string = "0123456789abcdef"
+    // 用例 1：有向 + varint 索引 id；3 节点；3 边（标签+权重 / 仅权重 / 有向覆盖 false+权重）
+    var gn = table_new_i64()
+    table_push(gn, 10); table_push(gn, 20); table_push(gn, 30)
+    var gns = table_new_string()
+    var gf = table_new_i64()
+    var gt = table_new_i64()
+    var gdp = table_new_i64()
+    var gd = table_new_i64()
+    var gl = table_new_string()
+    var gw = table_new_f64()
+    table_push(gf, 0); table_push(gt, 1); table_push(gdp, 0); table_push(gd, 0)
+    table_push(gl, "e01"); table_push(gw, 1.5)
+    table_push(gf, 1); table_push(gt, 2); table_push(gdp, 0); table_push(gd, 0)
+    table_push(gl, ""); table_push(gw, 0.0)
+    table_push(gf, 2); table_push(gt, 0); table_push(gdp, 1); table_push(gd, 0)
+    table_push(gl, ""); table_push(gw, 2.5)
+    var gd1 = zd_v3.graph_encode(true, false, gn, gns, gf, gt, gdp, gd, gl, gw)
+    var g1_hex: string = ""
+    var gi: i64 = 0
+    while gi < len(gd1) {
+        var gb = gd1[gi] & 0xFF
+        g1_hex = g1_hex + str_char(hexd3, gb >> 4) + str_char(hexd3, gb & 0xF)
+        gi = gi + 1
+    }
+    check(g1_hex == "01030a00001400001e000003000106a36530313ff80000000000000102040000000000000000020005004004000000000000",
+        "图容器（有向/索引 id/3 边）逐字节 == zd-java（KAT）")
+    var (gok, gdecl, gsid0, gid, gsid, gnn, gne, gpe) = zd_v3.graph_decode_open(gd1, 0)
+    check(gok, "图容器 open 解码 ok")
+    check(gdecl == 1, "声明：有向、索引 id")
+    check(len(gid) == 3 && gid[2] == 30, "节点 id 往返")
+    check(gnn == 3 && gne == 3, "节点数 / 边数")
+    var e_fr = table_new_i64()
+    var e_to = table_new_i64()
+    var e_hd = table_new_i64()
+    var e_dr = table_new_i64()
+    var e_lb = table_new_string()
+    var e_wb = table_new_i64()
+    var (geok, gnx) = zd_v3.graph_decode_edges(gd1, gpe, gnn, gne, e_fr, e_to, e_hd, e_dr, e_lb, e_wb)
+    check(geok, "图容器 edges 解码 ok")
+    check(gnx == len(gd1), "图容器自定界：next == 全长")
+    check(len(e_fr) == 3 && e_fr[2] == 2 && e_to[2] == 0, "边端点往返")
+    check(e_lb[0] == "e01" && bitcast_i64_f64(e_wb[0]) == 1.5, "边标签/权重往返")
+    check(e_dr[0] == 2 && e_dr[2] == 0, "有向覆盖往返（无覆盖=2 / false=0）")
+    check(e_hd[0] == 6 && e_hd[1] == 4, "边头位（bit1 标签 / bit2 权重）")
+
+    // 用例 2：无向 + string id；2 节点 1 边
+    var gn2 = table_new_i64()
+    var gns2 = table_new_string()
+    table_push(gns2, "alpha"); table_push(gns2, "beta")
+    var gf2 = table_new_i64()
+    var gt2 = table_new_i64()
+    var gdp2 = table_new_i64()
+    var gd2v = table_new_i64()
+    var gl2 = table_new_string()
+    var gw2 = table_new_f64()
+    table_push(gf2, 0); table_push(gt2, 1); table_push(gdp2, 0); table_push(gd2v, 0)
+    table_push(gl2, "x"); table_push(gw2, 1.0)
+    var gd2 = zd_v3.graph_encode(false, true, gn2, gns2, gf2, gt2, gdp2, gd2v, gl2, gw2)
+    var g2_hex: string = ""
+    var gj: i64 = 0
+    while gj < len(gd2) {
+        var gb2 = gd2[gj] & 0xFF
+        g2_hex = g2_hex + str_char(hexd3, gb2 >> 4) + str_char(hexd3, gb2 & 0xF)
+        gj = gj + 1
+    }
+    check(g2_hex == "0202a5616c7068610000a462657461000001000106a1783ff0000000000000",
+        "图容器（无向/string id）逐字节 == zd-java（KAT）")
+    var (g2ok, g2decl, g2sidf, _, g2sid, _, _, _) = zd_v3.graph_decode_open(gd2, 0)
+    check(g2ok && g2decl == 2 && len(g2sid) == 2 && g2sid[0] == "alpha", "string id 往返")
+
+    // 用例 3：空图（0 节点 0 边）合法
+    var egn = table_new_i64()
+    var egns = table_new_string()
+    var egf = table_new_i64()
+    var egt = table_new_i64()
+    var egdp = table_new_i64()
+    var egd = table_new_i64()
+    var egl = table_new_string()
+    var egw = table_new_f64()
+    var gd3 = zd_v3.graph_encode(true, false, egn, egns, egf, egt, egdp, egd, egl, egw)
+    check(len(gd3) == 3 && gd3[0] == 1 && gd3[1] == 0 && gd3[2] == 0, "空图 = 01 00 00（KAT）")
+    var (g3ok, _, _, _, _, g3nn, g3ne, g3pe) = zd_v3.graph_decode_open(gd3, 0)
+    check(g3ok && g3nn == 0 && g3ne == 0 && g3pe == 3, "空图解码 ok 且自定界")
+
+    // 约束：节点 id 重复 → 拒绝
+    var dupn = table_new_i64()
+    table_push(dupn, 5); table_push(dupn, 5)
+    var dn2 = table_new_string()
+    var df2 = table_new_i64()
+    var dt2 = table_new_i64()
+    var ddp2 = table_new_i64()
+    var dd2 = table_new_i64()
+    var dl2 = table_new_string()
+    var dw2 = table_new_f64()
+    check(len(zd_v3.graph_encode(true, false, dupn, dn2, df2, dt2, ddp2, dd2, dl2, dw2)) == 0,
+        "节点 id 重复 → 拒绝")
+    // 约束：边端点越界 → 拒绝
+    var of2 = table_new_i64()
+    var ot2 = table_new_i64()
+    var odp2 = table_new_i64()
+    var od2 = table_new_i64()
+    var ol2 = table_new_string()
+    var ow2 = table_new_f64()
+    table_push(of2, 0); table_push(ot2, 9); table_push(odp2, 0); table_push(od2, 0)
+    table_push(ol2, ""); table_push(ow2, 1.0)
+    check(len(zd_v3.graph_encode(true, false, gn, gns, of2, ot2, odp2, od2, ol2, ow2)) == 0,
+        "边端点越界(9 >= 3 节点) → 拒绝")
+    // 约束：解码侧端点越界 → 拒绝（手工构造端点 9 的字节）
+    var badg: table<i64> = [1, 3, 10, 0, 0, 20, 0, 0, 30, 0, 0, 1, 0, 9, 4,
+        0, 0, 0, 0, 0, 0, 0, 0]
+    var (bok2, _, _, _, _, bnn2, bne2, bpe2) = zd_v3.graph_decode_open(badg, 0)
+    var bfr2 = table_new_i64()
+    var bto2 = table_new_i64()
+    var bhd2 = table_new_i64()
+    var bdr2 = table_new_i64()
+    var blb2 = table_new_string()
+    var bwb2 = table_new_i64()
+    var (beok2, _) = zd_v3.graph_decode_edges(badg, bpe2, bnn2, bne2, bfr2, bto2, bhd2, bdr2, blb2, bwb2)
+    check(bok2 && !beok2, "解码侧端点越界 → 拒绝")
+    // 未覆盖面：列式声明位（bit2）→ 确定性拒绝（不静默降级）
+    var colg: table<i64> = [5, 0, 0]
+    var (cok, _, _, _, _, _, _, _) = zd_v3.graph_decode_open(colg, 0)
+    check(!cok, "声明 bit2（列式形态，未覆盖）→ 确定性拒绝")
+    // 未覆盖面：节点载荷标志置位 → 拒绝
+    var plg: table<i64> = [1, 1, 10, 1, 0, 0, 0]
+    var (pok, _, _, _, _, _, _, _) = zd_v3.graph_decode_open(plg, 0)
+    check(!pok, "节点载荷标志置位（嵌入形态，未覆盖）→ 确定性拒绝")
+    // 自环与多重边合法
+    var sfn = table_new_i64()
+    var stn = table_new_i64()
+    var sdp = table_new_i64()
+    var sdv = table_new_i64()
+    var sln = table_new_string()
+    var swn = table_new_f64()
+    table_push(sfn, 0); table_push(stn, 0); table_push(sdp, 0); table_push(sdv, 0)
+    table_push(sln, ""); table_push(swn, 1.0)
+    table_push(sfn, 0); table_push(stn, 0); table_push(sdp, 0); table_push(sdv, 0)
+    table_push(sln, ""); table_push(swn, 2.0)
+    var sgl = zd_v3.graph_encode(true, false, gn, gns, sfn, stn, sdp, sdv, sln, swn)
+    check(len(sgl) > 0, "自环 + 多重边合法")
+    // 图容器 ext 形态（标记 0x47）
+    var gext = zd_ext.encode_ext(0x47, gd3)
+    check(zd_v3.std_tag_of(gext) == 0x47, "图容器可作 ext 嵌入（标记 0x47）")
 
     // ---------- 7. 文件往返 ----------
     var path = work + "_v3.zd"

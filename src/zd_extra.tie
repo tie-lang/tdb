@@ -109,6 +109,105 @@ pub func decode_string_ref(pool: table<i64>, bytes: table<i64>, pos: i64) -> (st
     return (s, p2)
 }
 
+// ==================== 1b. 池哈希索引（p.9.6.2 性能优化） ====================
+// 旧 pool_index 每次查询线性扫全池、逐条 decode_string（O(条目数 × 串长)）；
+// 实测 2000 条池命中 90µs/次（probe_zd_perf poolidx）。本组建**开放寻址哈希索引**
+// （FNV-1a 32 位 + 线性探测），查询均摊 O(1)：
+//   var (buckets, ords, starts) = pool_index_build(pool)
+//   pool_lookup(pool, buckets, ords, starts, s) -> 序号 / -1
+//   buckets[h] = 槽占用标记（1 = 占用），ords[h] = 池内序号，starts[h] = 条目起点。
+// 索引容量 2^k ≥ 2 × 条目数；一次 build 可复用多次 lookup（调用方缓存）。
+// 旧 pool_index 保留（小池/无索引场景），语义不变。
+
+// pidx_fnv32：FNV-1a 32 位（偏移基 2166136261、质数 16777619），逐字节，掩 32 位。
+func pidx_fnv32(t: table<i64>, start: i64, n: i64) -> i64 {
+    var h: i64 = 2166136261
+    var i: i64 = 0
+    while i < n {
+        h = ((h ^ (zd.u8_at(t, start + i) & 0xFF)) * 16777619) & 0xFFFFFFFF
+        i = i + 1
+    }
+    return h
+}
+
+// pool_index_build：扫描池段建哈希索引 → (buckets, ords, starts)。
+pub func pool_index_build(pool: table<i64>) -> (table<i64>, table<i64>, table<i64>) {
+    var starts = table_new_i64()
+    var pos: i64 = 0
+    var n: i64 = len(pool)
+    while pos < n {
+        var (payload, ln, next) = decode_string_ref_view(pool, pos)
+        if next < 0 {
+            break
+        }
+        table_push(starts, pos)
+        pos = next
+    }
+    var cnt: i64 = len(starts)
+    var cap: i64 = 16
+    while cap < cnt * 2 {
+        cap = cap * 2
+    }
+    var buckets = table_new_i64()
+    var ords = table_new_i64()
+    var k: i64 = 0
+    while k < cap {
+        table_push(buckets, 0)
+        table_push(ords, 0)
+        k = k + 1
+    }
+    var i: i64 = 0
+    while i < cnt {
+        var (ps, ln2, nx2) = decode_string_ref_view(pool, starts[i])
+        var h = pidx_fnv32(pool, ps, ln2) & (cap - 1)
+        while buckets[h] != 0 {
+            h = (h + 1) & (cap - 1)
+        }
+        buckets[h] = 1
+        ords[h] = i
+        i = i + 1
+    }
+    return (buckets, ords, starts)
+}
+
+// pidx_eq：池内 [start, start+n) 与查询 UTF-8 载荷逐字节相等。
+func pidx_eq(pool: table<i64>, start: i64, body: table<i64>, n: i64) -> bool {
+    var i: i64 = 0
+    while i < n {
+        if zd.u8_at(pool, start + i) != zd.u8_at(body, i) {
+            return false
+        }
+        i = i + 1
+    }
+    return true
+}
+
+// pool_lookup：哈希查出序号；未命中 -1；空索引 -1。
+pub func pool_lookup(pool: table<i64>, buckets: table<i64>, ords: table<i64>,
+                     starts: table<i64>, s: string) -> i64 {
+    var cap: i64 = len(buckets)
+    if cap == 0 {
+        return -1
+    }
+    var body = zd.utf8_encode(s)
+    var n: i64 = len(body)
+    var h = pidx_fnv32(body, 0, n) & (cap - 1)
+    var guard: i64 = 0
+    while guard <= cap {
+        if buckets[h] == 0 {
+            return -1
+        }
+        var st = starts[ords[h]]
+        var (ps, ln, nx) = decode_string_ref_view(pool, st)
+        if nx >= 0 && ln == n && pidx_eq(pool, ps, body, n) {
+            return ords[h]
+        }
+        h = (h + 1) & (cap - 1)
+        guard = guard + 1
+    }
+    return -1
+}
+
 // ==================== 2. 列式容器（flags bit1） ====================
 // 字节格式：0xD6 | varint ncols | ncols×varint 类型码 | 每列
 //   (varint 元素数 + 各元素)。类型码 0=i64 1=f64 2=string 3=bool。

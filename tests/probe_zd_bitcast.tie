@@ -102,7 +102,7 @@ func main() {
     var arr: table<f64> = table_new_f64()
     var n: i64 = 0
     while n < 100 {
-        table_push(arr, as_f64(n) * 0.5)
+        table_push(arr, parse_float(to_string(n)) * 0.5)
         n = n + 1
     }
     var enc = zdb.encode_f64_array_batch(arr)

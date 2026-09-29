@@ -1,0 +1,240 @@
+type tie<logic>
+// probe_zd_v3: zd v3 骨架面（头 / 索引 footer / 段表 / 多段文档 / 读义务 / 一致性门）
+// ---------------------------------------------------------------------------
+// 对齐权威实现 zd-java（tie-lang/zd-java）。覆盖：
+//   1. 头：10 字节、版本 base-48 "03"、flags 低 7 位掩码
+//   2. 读义务：v2/v3 都接受；v1 头可识别但不在 v2+v3 读义务内
+//   3. 索引 footer：25 字节、crc32 覆盖索引段、坏 crc 拒绝
+//   4. 段表：编码/解码往返；自定义段名必填；负偏移/长度拒绝
+//   5. 多段文档：assemble/read 往返、**按类型查找不假设段序**、flags 自动置位
+//   6. 一致性门：非 v3 / bit5 未置 / crc 不符 / 段越界 → 确定性拒绝
+//   7. 文件往返：save_v3 / load_v3
+import "../src/zd.tie"
+import "../src/zd_v3.tie"
+
+var fails: i64 = 0
+
+func check(cond: bool, msg: string) {
+    if cond {
+        println("PASS " + msg)
+    } else {
+        println("FAIL " + msg)
+        fails = fails + 1
+    }
+}
+
+// mkbytes：n 字节（值 0..255 循环）。
+func mkbytes(n: i64) -> table<i64> {
+    var t = table_new_i64()
+    var i: i64 = 0
+    while i < n {
+        table_push(t, i & 0xFF)
+        i = i + 1
+    }
+    return t
+}
+
+// mkstrs：字面量字符串表，避免逐元素 push 的开销差异影响断言。
+// 段表用名：第 0 项给数据段（可空）、第 1 项给列式段、第 2 项给**自定义段**
+// （类型 6 名必填，故此处必须非空）。
+func mkstrs() -> table<string> {
+    var t = table_new_string()
+    table_push(t, "")
+    table_push(t, "meta")
+    table_push(t, "custom")
+    return t
+}
+
+func main() {
+    var work: string = arg_string(0)
+    if str_len(work) == 0 {
+        work = "/tmp/zdv3probe"
+    }
+
+    // ---------- 1. 头 ----------
+    var h = zd_v3.make_header_v3(0)
+    check(len(h) == 10, "头长度 10 字节")
+    check(zd_v3.header_version(h) == 3, "头版本 = 3（base-48 \"03\"）")
+    check(zd_v3.is_v3(h), "is_v3 判据")
+    var h2 = zd_v3.make_header_v3(0xFF)
+    check(zd_v3.header_flags(h2) == 0x7F, "flags 掩码取低 7 位（0xFF → 0x7F）")
+    check(h[0] == 0x54 && h[6] == 0x44, "魔数 TIEDBZD")
+    check(h[7] == 0x00 && h[8] == 0x03, "版本两位 = 0x00 0x03")
+
+    // ---------- 2. 读义务（v2/v3 都接受；v1 可识别但不在义务内） ----------
+    var hdr_v2: table<i64> = [0x54, 0x49, 0x45, 0x44, 0x42, 0x5A, 0x44, 0x00, 0x02, 0x00]
+    var hdr_v1: table<i64> = [0x54, 0x49, 0x45, 0x44, 0x42, 0x5A, 0x44, 0x01]
+    var hdr_bad: table<i64> = [0x41, 0x42, 0x43, 0x44, 0x45, 0x46, 0x47, 0x00, 0x03, 0x00]
+    check(zd_v3.header_version(hdr_v2) == 2, "v2 头识别为版本 2")
+    check(zd_v3.header_version(hdr_v1) == 1, "v1 头（8 字节）识别为版本 1")
+    check(zd_v3.header_version(hdr_bad) == -1, "非法魔数 → -1")
+    check(zd_v3.accept_v2_or_v3(hdr_v2) && zd_v3.accept_v2_or_v3(h),
+        "读义务 = v2 + v3（两者都接受）")
+    check(!zd_v3.accept_v2_or_v3(hdr_v1), "v1 头不在 v2+v3 读义务内")
+    check(!zd_v3.is_v3(hdr_v2), "v2 头不是 v3")
+
+    // ---------- 3. 索引 footer ----------
+    var idx_payload = mkbytes(20)
+    var foot = zd_v3.footer_write(100, idx_payload)
+    check(len(foot) == 25, "footer 长度 25 字节")
+    check(foot[0] == 0x5A && foot[4] == 0x54, "footer 魔数 ZD3FT")
+    // 组装一个文件再探测
+    var types1 = table_new_i64()
+    var names1 = table_new_string()
+    var blob1 = mkbytes(30)
+    var soffs1 = table_new_i64()
+    var slens1 = table_new_i64()
+    table_push(types1, 0)
+    table_push(soffs1, 0)
+    table_push(slens1, 30)
+    table_push(names1, "")
+    var doc = zd_v3.assemble(0, types1, blob1, soffs1, slens1, names1)
+    check(len(doc) > 0, "assemble 单段文档非空")
+    var (has, ioff, ilen, icrc) = zd_v3.footer_probe(doc)
+    check(has, "footer_probe 命中魔数")
+    check(ioff == 10 + 30, "index_off = 10(头) + 30(段载荷) = 40")
+    check(ilen > 0, "index_len > 0")
+    var idx_bytes = zd.slice(doc, ioff, ioff + ilen)
+    check(zd_v3.footer_crc_ok(idx_bytes, icrc), "footer crc32 与索引段一致")
+    check(!zd_v3.footer_crc_ok(idx_bytes, icrc + 1), "crc 不符 → 拒绝")
+
+    // ---------- 4. 段表编码/解码往返 ----------
+    var tys = table_new_i64()
+    var offs = table_new_i64()
+    var lens = table_new_i64()
+    var nms = mkstrs()
+    table_push(tys, 0)
+    table_push(offs, 10)
+    table_push(lens, 100)
+    table_push(tys, 2)
+    table_push(offs, 110)
+    table_push(lens, 200)
+    table_push(tys, 6)
+    table_push(offs, 310)
+    table_push(lens, 5)
+    // 注意：类型 6（自定义段）**名称必填**——mkstrs() 的第 2 项须为非空
+    var enc_idx = zd_v3.encode_index(tys, offs, lens, nms)
+    check(len(enc_idx) > 0, "段表编码非空")
+    var (dtys, doffs, dlens, dnms, dnext) = zd_v3.decode_index(enc_idx, 0)
+    check(dnext == len(enc_idx), "段表解码消费全部字节")
+    check(len(dtys) == 3, "段表解码 3 段")
+    check(dtys[0] == 0 && dtys[2] == 6, "段类型往返")
+    check(doffs[1] == 110 && dlens[1] == 200, "偏移/长度往返")
+    check(dnms[1] == "meta", "段名往返")
+
+    // 自定义段名必填（类型 6 + 空名 → 拒绝）
+    var bad_tys = table_new_i64()
+    var bad_offs = table_new_i64()
+    var bad_lens = table_new_i64()
+    var bad_nms = table_new_string()
+    table_push(bad_tys, 6)
+    table_push(bad_offs, 10)
+    table_push(bad_lens, 1)
+    table_push(bad_nms, "")
+    check(len(zd_v3.encode_index(bad_tys, bad_offs, bad_lens, bad_nms)) == 0,
+        "自定义段（类型 6）名称必填 → 空名拒绝")
+    // 负偏移拒绝
+    var neg_offs = table_new_i64()
+    table_push(neg_offs, 0 - 1)
+    check(len(zd_v3.encode_index(tys, neg_offs, lens, nms)) == 0, "负偏移拒绝")
+
+    // ---------- 5. 多段文档往返 + 段序无关 + flags 自动置位 ----------
+    var t5 = table_new_i64()
+    var n5 = table_new_string()
+    var o5 = table_new_i64()
+    var l5 = table_new_i64()
+    var a5 = mkbytes(11)
+    var b5 = mkbytes(22)
+    var c5 = mkbytes(33)
+    var d5 = mkbytes(44)
+    // blob = 四段顺序拼接（首段相对偏移 0，首尾相接）
+    var blob5 = zd.concat(a5, zd.concat(b5, zd.concat(c5, d5)))
+    table_push(t5, 0)
+    table_push(o5, 0)
+    table_push(l5, 11)
+    table_push(n5, "")
+    table_push(t5, 1)
+    table_push(o5, 11)
+    table_push(l5, 22)
+    table_push(n5, "")
+    table_push(t5, 4)
+    table_push(o5, 33)
+    table_push(l5, 33)
+    table_push(n5, "")
+    table_push(t5, 3)
+    table_push(o5, 66)
+    table_push(l5, 44)
+    table_push(n5, "")
+    var doc5 = zd_v3.assemble(zd_v3.flag_stream(), t5, blob5, o5, l5, n5)
+    check(len(doc5) > 0, "assemble 四段文档非空")
+    var f5 = zd_v3.header_flags(doc5)
+    check((f5 & zd_v3.flag_index()) != 0, "bit5 索引 footer 恒置")
+    check((f5 & zd_v3.flag_dictionary()) != 0, "含字符串池段 → bit0 自动置位")
+    check((f5 & zd_v3.flag_graph()) != 0, "含图段 → bit6 自动置位")
+    check((f5 & zd_v3.flag_stream()) != 0, "调用方 flags（bit3 流式）并入")
+    check((f5 & zd_v3.flag_columnar()) == 0, "无列式段 → bit1 不置位")
+
+    var (ok5, rt5, ro5, rl5, rn5) = zd_v3.read_index(doc5)
+    check(ok5, "read_index 一致 → ok")
+    check(len(rt5) == 4, "读回 4 段表项")
+    // **按类型查找（不假设段序）**
+    var i_data = zd_v3.find_segment(rt5, rn5, 0, "")
+    var i_pool = zd_v3.find_segment(rt5, rn5, 1, "")
+    var i_graph = zd_v3.find_segment(rt5, rn5, 4, "")
+    var i_sch = zd_v3.find_segment(rt5, rn5, 3, "")
+    check(i_data >= 0 && i_pool >= 0 && i_graph >= 0 && i_sch >= 0, "四段类型均可定位")
+    var sdata = zd_v3.segment_bytes(doc5, ro5, rl5, i_data)
+    var spool = zd_v3.segment_bytes(doc5, ro5, rl5, i_pool)
+    var sgraph = zd_v3.segment_bytes(doc5, ro5, rl5, i_graph)
+    var ssch = zd_v3.segment_bytes(doc5, ro5, rl5, i_sch)
+    check(len(sdata) == 11 && len(spool) == 22 &&
+          len(sgraph) == 33 && len(ssch) == 44, "各段载荷长度正确（按类型定位）")
+    check(sdata[3] == 3 && sgraph[5] == 5, "各段载荷内容正确")
+
+    // ---------- 6. 一致性门（确定性拒绝） ----------
+    // 非 v3：改版本位为 0x02
+    var doc_v2 = zd.slice(doc5, 0, len(doc5))
+    doc_v2[8] = 0x02
+    var (ok_v2, _, _, _, _) = zd_v3.read_index(doc_v2)
+    check(!ok_v2, "非 v3（版本 02）→ 拒绝")
+    // bit5 未置位
+    var doc_nb5 = zd.slice(doc5, 0, len(doc5))
+    doc_nb5[9] = doc_nb5[9] & 0x1F
+    var (ok_nb5, _, _, _, _) = zd_v3.read_index(doc_nb5)
+    check(!ok_nb5, "bit5 未置位（与 footer 存在不一致）→ 拒绝")
+    // crc 篡改
+    var doc_crc = zd.slice(doc5, 0, len(doc5))
+    var tl = len(doc_crc) - 25
+    doc_crc[tl + 24] = (doc_crc[tl + 24] ^ 0xFF) & 0xFF
+    var (ok_crc, _, _, _, _) = zd_v3.read_index(doc_crc)
+    check(!ok_crc, "footer crc32 篡改 → 拒绝")
+    // 无 footer
+    var (ok_nf, _, _, _, _) = zd_v3.read_index(mkbytes(50))
+    check(!ok_nf, "无 footer → 拒绝")
+
+    // ---------- 7. 文件往返 ----------
+    var path = work + "_v3.zd"
+    var body = mkbytes(64)
+    check(zd_v3.save_v3(path, body, 0), "save_v3 写文件成功")
+    var data = byte_read(path)
+    check(len(data) == 10 + 64 + (len(data) - 10 - 64), "读回文件字节数自洽")
+    var (lok, lbody) = zd_v3.load_v3(path)
+    check(lok, "load_v3 成功")
+    check(len(lbody) == 64, "load_v3 数据体长度 64")
+    var same: bool = true
+    var i: i64 = 0
+    while i < 64 {
+        if lbody[i] != body[i] {
+            same = false
+        }
+        i = i + 1
+    }
+    check(same, "load_v3 数据体逐字节一致")
+
+    if fails == 0 {
+        println("PASS all")
+    } else {
+        println("FAIL total=" + to_string(fails))
+    }
+    println("done")
+}

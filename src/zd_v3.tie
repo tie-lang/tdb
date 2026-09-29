@@ -1,0 +1,454 @@
+type tie<class>
+// tiedb/src/zd_v3.tie —— zd v3 载体（namespace zd_v3，纯 tie 实现）
+// ============================================================================
+// 对齐权威实现 zd-java（tie-lang/zd-java，0.2.0）与语言规范 §17.2 /
+// `2026-09-28-zd-v3-design.md`。本文件实现 v3 **骨架面**：头 / 索引 footer /
+// 段表 / 多段文档；列式编码族（段类型 2）与字符串池（段类型 1）复用 zd_extra 的
+// 既实现，schema 段（类型 3）与图容器（类型 4）见后续分片。
+//
+// v3 纪律（写方默认 v3；v2 布局全兼容）：
+//   - 头 10 字节 = "TIEDBZD"(7) + base-48 版本两位（v2 = 0x00 0x02、v3 = 0x00 0x03）
+//     + flags 1 字节；**读义务 = v2 + v3**（两者都接受），**写方禁写 v1**。
+//   - flags：v2 五位（bit0 字典 / bit1 列式 / bit2 ext / bit3 流式 / bit4 压缩变体）
+//     之上新增 bit5 索引 footer、bit6 图容器（纯提示位）；**v3 写侧掩码 = 低 7 位**，
+//     v2 路径低 5 位。
+//   - 索引 footer 25 字节 = "ZD3FT"(5) + index_off(u64 BE) + index_len(u64 BE)
+//     + crc32(u32 BE)；crc32 覆盖**索引段**字节。
+//   - 段表 = varint 段数 + 各段 [类型 varint][文件内偏移 u64 BE][长度 u64 BE]
+//     [名称 varint 前缀 + UTF-8]；偏移为**文件内绝对偏移**（含 10 字节头）。
+//   - 段类型：0 数据体 / 1 字符串池 / 2 列式 / 3 schema / 4 图 / 5 压缩 / 6 自定义。
+//     类型 6（自定义）**名称必填**（空名确定性拒绝）；同 (类型, 名称) 不得重复。
+//   - **footer 存在时消费方必须经索引定位段、不得假设段序**。
+//   - assemble 自动置位：bit5 恒置；bit0/bit1/bit6/bit4 随段类型（池/列式/图/压缩）
+//     自动置位；bit2/bit3 由调用方 flags 传入。
+//
+// 性能（r.1.6.6 起）：全部构造走 memcpy 级原语——段表用「构建器 + 就地追加」
+// （`out = zd.concat(out, seg)` 经编译器自加提升为就地追加），避免逐元素 push 的
+// 60ns/元素 与 O(n²) 拷贝。
+
+import "./zd.tie"
+import "./zd_stream.tie"
+
+namespace zd_v3 {
+
+// ---------- 常量 ----------
+
+// 段类型（与 zd-java ZdFooter.SEG_* 逐值一致）。
+pub func seg_data() -> i64 { return 0 }
+pub func seg_string_pool() -> i64 { return 1 }
+pub func seg_columnar() -> i64 { return 2 }
+pub func seg_schema() -> i64 { return 3 }
+pub func seg_graph() -> i64 { return 4 }
+pub func seg_compressed() -> i64 { return 5 }
+pub func seg_custom() -> i64 { return 6 }
+
+// flags 位（v3 低 7 位；v2 路径低 5 位）。
+pub func flag_dictionary() -> i64 { return 1 }        // bit0
+pub func flag_columnar() -> i64 { return 1 << 1 }     // bit1
+pub func flag_ext() -> i64 { return 1 << 2 }          // bit2
+pub func flag_stream() -> i64 { return 1 << 3 }       // bit3
+pub func flag_compressed() -> i64 { return 1 << 4 }   // bit4
+pub func flag_index() -> i64 { return 1 << 5 }        // bit5（索引 footer）
+pub func flag_graph() -> i64 { return 1 << 6 }        // bit6（纯提示位）
+pub func flags_mask_v3() -> i64 { return 0x7F }       // 低 7 位
+pub func flags_mask_v2() -> i64 { return 0x1F }       // 低 5 位
+
+// footer 长度（25 字节）。
+pub func footer_len() -> i64 { return 25 }
+
+// v3 版本两位（base-48 高位在前 → version = 0*48 + 3 = 3）。
+pub func version_v3() -> i64 { return 3 }
+
+// ---------- 头（10 字节） ----------
+
+// make_header_v3：魔数 + "03" + flags（低 7 位掩码）。单次分配字面量构造。
+pub func make_header_v3(flags: i64) -> table<i64> {
+    var f = flags & 0x7F
+    return [0x54, 0x49, 0x45, 0x44, 0x42, 0x5A, 0x44, 0x00, 0x03, f]
+}
+
+// header_version：头部版本号（base-48 两位 → d1*48 + d2）。
+// v1（8 字节头，魔数 + 0x01）返回 1；v2/v3 返回 2/3；非法返回 -1。
+// **读义务 = v2 + v3**：v1 头仍被识别（读兼容），但 v3 写方禁写 v1。
+pub func header_version(t: table<i64>) -> i64 {
+    if len(t) < 8 {
+        return -1
+    }
+    if t[0] != 0x54 || t[1] != 0x49 || t[2] != 0x45 || t[3] != 0x44 ||
+        t[4] != 0x42 || t[5] != 0x5A || t[6] != 0x44 {
+        return -1
+    }
+    if t[7] == 0x01 {
+        return 1
+    }
+    if len(t) < 10 || t[7] < 0 || t[7] > 47 || t[8] < 0 || t[8] > 47 {
+        return -1
+    }
+    return t[7] * 48 + t[8]
+}
+
+// header_flags：头部 flags 字节（非法头返回 -1；v1 无 flags → 0）。
+pub func header_flags(t: table<i64>) -> i64 {
+    var v = header_version(t)
+    if v < 0 {
+        return -1
+    }
+    if v == 1 {
+        return 0
+    }
+    return t[9]
+}
+
+// is_v3：是否 v3 头（严格 version == 3）。
+pub func is_v3(t: table<i64>) -> bool {
+    return header_version(t) == 3
+}
+
+// accept_v2_or_v3：读义务判据——v2/v3 任一合法头即接受（v1 头不在此列，
+// 但 header_version 仍可识别它以支持既有 v1 读路径）。
+pub func accept_v2_or_v3(t: table<i64>) -> bool {
+    var v = header_version(t)
+    return v == 2 || v == 3
+}
+
+// ---------- 索引 footer（25 字节） ----------
+
+// footer_write：由索引段「文件内偏移 + 索引段字节」写出 25 字节 footer。
+// crc32 由本函数**现算**（不信任调用方）。
+pub func footer_write(index_off: i64, index_bytes: table<i64>) -> table<i64> {
+    var crc = zd_stream.crc32(index_bytes)
+    var n: i64 = len(index_bytes)
+    var head: table<i64> = [0x5A, 0x44, 0x33, 0x46, 0x54]   // "ZD3FT"
+    var body: table<i64> = [
+        (index_off >> 56) & 0xFF, (index_off >> 48) & 0xFF, (index_off >> 40) & 0xFF,
+        (index_off >> 32) & 0xFF, (index_off >> 24) & 0xFF, (index_off >> 16) & 0xFF,
+        (index_off >> 8) & 0xFF, index_off & 0xFF,
+        (n >> 56) & 0xFF, (n >> 48) & 0xFF, (n >> 40) & 0xFF, (n >> 32) & 0xFF,
+        (n >> 24) & 0xFF, (n >> 16) & 0xFF, (n >> 8) & 0xFF, n & 0xFF,
+        (crc >> 24) & 0xFF, (crc >> 16) & 0xFF, (crc >> 8) & 0xFF, crc & 0xFF]
+    return zd.concat(head, body)
+}
+
+// footer_probe：文件尾探测 → (has, index_off, index_len, crc)。
+// 尾 25 字节魔数匹配才返回 has=true；**魔数匹配但校验失败**（越界 / crc 不符）
+// 返回 has=false 并由 ok 区分——调用方据 ok 判定「坏 footer」而非「无 footer」。
+// 返回 (has, index_off, index_len, crc, crc_ok)：crc_ok 需调用方传入索引段字节后
+// 用 footer_crc_ok 复核；此处只解析。
+pub func footer_probe(data: table<i64>) -> (bool, i64, i64, i64) {
+    var n: i64 = len(data)
+    if n < 25 {
+        return (false, 0, 0, 0)
+    }
+    var tail: i64 = n - 25
+    if data[tail] != 0x5A || data[tail + 1] != 0x44 || data[tail + 2] != 0x33 ||
+        data[tail + 3] != 0x46 || data[tail + 4] != 0x54 {
+        return (false, 0, 0, 0)
+    }
+    var off: i64 = 0
+    var i: i64 = 0
+    while i < 8 {
+        off = (off << 8) | (data[tail + 5 + i] & 0xFF)
+        i = i + 1
+    }
+    var ln: i64 = 0
+    i = 0
+    while i < 8 {
+        ln = (ln << 8) | (data[tail + 13 + i] & 0xFF)
+        i = i + 1
+    }
+    var crc: i64 = 0
+    i = 0
+    while i < 4 {
+        crc = (crc << 8) | (data[tail + 21 + i] & 0xFF)
+        i = i + 1
+    }
+    return (true, off, ln, crc)
+}
+
+// footer_crc_ok：索引段字节的 crc32 是否与 footer 记录值一致。
+// （footer 存在 + bit5 置位 + crc 一致 = 索引可信；三者任一不成立即拒绝定位段。）
+pub func footer_crc_ok(index_bytes: table<i64>, crc: i64) -> bool {
+    return zd_stream.crc32(index_bytes) == crc
+}
+
+// ---------- 段表 ----------
+
+// encode_index：段表 → 字节。
+//   varint 段数 + 各段 [类型 varint][文件内偏移 u64 BE][长度 u64 BE]
+//                    [名称字节数 varint + 名称 UTF-8]
+// 约束（确定性拒绝，返回空表）：偏移/长度为负；类型 6（自定义）名称为空。
+// 用「构建器 + 就地追加」——`out = zd.concat(out, seg)` 被编译器提升为就地追加，
+// 摊销 O(1)/次，避免逐元素 push 与 O(n²) 拷贝。
+pub func encode_index(types: table<i64>, offsets: table<i64>,
+                      lens: table<i64>, names: table<string>) -> table<i64> {
+    var n: i64 = len(types)
+    if len(offsets) != n || len(lens) != n || len(names) != n {
+        return table_new_i64()
+    }
+    var i: i64 = 0
+    while i < n {
+        if offsets[i] < 0 || lens[i] < 0 {
+            return table_new_i64()
+        }
+        if types[i] == 6 && str_len(names[i]) == 0 {
+            return table_new_i64()   // 自定义段名称必填
+        }
+        i = i + 1
+    }
+    var out = zd.write_varint(n)
+    var k: i64 = 0
+    while k < n {
+        var seg = zd.write_varint(types[k])
+        seg = zd.concat(seg, zd.write_u64_be(offsets[k]))
+        seg = zd.concat(seg, zd.write_u64_be(lens[k]))
+        var nb = zd.utf8_encode(names[k])
+        seg = zd.concat(seg, zd.write_varint(len(nb)))
+        seg = zd.concat(seg, nb)
+        out = zd.concat(out, seg)
+        k = k + 1
+    }
+    return out
+}
+
+// decode_index：段表字节 → (类型表, 偏移表, 长度表, 名称表, next)；失败 next = -1。
+pub func decode_index(bytes: table<i64>, pos: i64) -> (table<i64>, table<i64>, table<i64>, table<string>, i64) {
+    var types = table_new_i64()
+    var offsets = table_new_i64()
+    var lens = table_new_i64()
+    var names = table_new_string()
+    var (n, p0) = zd.read_varint(bytes, pos)
+    if p0 < 0 || n < 0 {
+        return (types, offsets, lens, names, -1)
+    }
+    var p: i64 = p0
+    var i: i64 = 0
+    while i < n {
+        var (ty, p1) = zd.read_varint(bytes, p)
+        if p1 < 0 {
+            return (types, offsets, lens, names, -1)
+        }
+        var (off, p2) = zd.read_u64_be(bytes, p1)
+        if p2 < 0 {
+            return (types, offsets, lens, names, -1)
+        }
+        var (ln, p3) = zd.read_u64_be(bytes, p2)
+        if p3 < 0 {
+            return (types, offsets, lens, names, -1)
+        }
+        var (nl, p4) = zd.read_varint(bytes, p3)
+        if p4 < 0 || nl < 0 || p4 + nl > len(bytes) {
+            return (types, offsets, lens, names, -1)
+        }
+        var nm = zd.slice(bytes, p4, p4 + nl)
+        table_push(types, ty)
+        table_push(offsets, off)
+        table_push(lens, ln)
+        table_push(names, bytes_to_str(nm))
+        p = p4 + nl
+        i = i + 1
+    }
+    return (types, offsets, lens, names, p)
+}
+
+// bytes_to_str：UTF-8 字节表 → 字符串（段表名称用；名称是 UTF-8 文本）。
+// 用 StringBuilder 一次构建（摊销 O(n)，避免逐码点 str_cat 的 O(n²)）。
+func bytes_to_str(b: table<i64>) -> string {
+    var sb = string_builder()
+    var n: i64 = len(b)
+    var i: i64 = 0
+    while i < n {
+        sb_append_byte(sb, b[i] & 0xFF)
+        i = i + 1
+    }
+    return sb_build(sb)
+}
+
+// ---------- 多段文档：组装 ----------
+
+// seg_flags：段类型 → 该段自动置位的 flags 位（数据/schema/自定义不置位）。
+func seg_flags(ty: i64) -> i64 {
+    if ty == 1 {
+        return 1          // 字符串池 → bit0 字典
+    }
+    if ty == 2 {
+        return 1 << 1     // 列式 → bit1
+    }
+    if ty == 4 {
+        return 1 << 6     // 图 → bit6
+    }
+    if ty == 5 {
+        return 1 << 4     // 压缩 → bit4
+    }
+    return 0
+}
+
+// assemble：多段文档组装 → 完整文件字节（**扁平接口：零嵌套表**）。
+//   头（bit5 恒置；bit0/bit1/bit6/bit4 随段类型自动置位；bit2/bit3 由 flags 传入）
+//   + 段载荷区 blob（各段按给定序拼接）+ 索引段 + 25 字节 footer（crc32 覆盖索引段）。
+//    seg_offs/seg_lens 描述 blob 内各段的切分（相对偏移，第 0 段须为 0 且首尾相接）。
+// 约束（确定性拒绝，空表）：三表长度不等；段类型不在 0..6；类型 6 名称空；
+//   同 (类型, 名称) 重复；blob 切分越界。
+// **扁平接口的原因**：`table<table<i64>>` 作为元组成员时编译器内部表示为 i64
+// （非 ptr），会破坏聚合类型；且扁平形态下组装只是「头 + blob + 索引 + footer」
+// 三次 memcpy 级拼接，比逐段 append 更省。
+pub func assemble(flags: i64, types: table<i64>, blob: table<i64>,
+                  seg_offs: table<i64>, seg_lens: table<i64>, names: table<string>) -> table<i64> {
+    var n: i64 = len(types)
+    if len(seg_offs) != n || len(seg_lens) != n || len(names) != n {
+        return table_new_i64()
+    }
+    var hf: i64 = 1 << 5   // bit5 恒置
+    var i: i64 = 0
+    while i < n {
+        var ty = types[i]
+        if ty < 0 || ty > 6 {
+            return table_new_i64()
+        }
+        if ty == 6 && str_len(names[i]) == 0 {
+            return table_new_i64()
+        }
+        if seg_offs[i] < 0 || seg_lens[i] < 0 || seg_offs[i] + seg_lens[i] > len(blob) {
+            return table_new_i64()
+        }
+        hf = hf | seg_flags(ty)
+        i = i + 1
+    }
+    // 重复 (类型, 名称) 拒绝
+    i = 0
+    while i < n {
+        var j: i64 = i + 1
+        while j < n {
+            if types[i] == types[j] && names[i] == names[j] {
+                return table_new_i64()
+            }
+            j = j + 1
+        }
+        i = i + 1
+    }
+    // 调用方 flags（低 7 位）并入；bit5 已恒置，OR 进来仍是置位，无需清除
+    hf = hf | (flags & 0x7F)
+    // 段表偏移 = 文件内绝对偏移 = 10(头) + blob 内相对偏移
+    var abs_offs = table_new_i64()
+    i = 0
+    while i < n {
+        table_push(abs_offs, 10 + seg_offs[i])
+        i = i + 1
+    }
+    var index = encode_index(types, abs_offs, seg_lens, names)
+    if len(index) == 0 {
+        return table_new_i64()
+    }
+    var out = make_header_v3(hf)
+    out = zd.concat(out, blob)
+    var index_off: i64 = len(out)
+    out = zd.concat(out, index)
+    var foot = footer_write(index_off, index)
+    return zd.concat(out, foot)
+}
+
+// ---------- 多段文档：读取 ----------
+
+// read_index：经 footer 段表定位段（**校验并解出段表，不切载荷**）→
+//   (ok, types, abs_offsets, lens, names)。ok=false 时四表为空。
+// 一致性门（任一不成立 → ok=false）：无 footer；非 v3；bit5 未置位；crc 不符；
+//   段偏移/长度越界（越出「段载荷区」，即不得进入索引段/footer）。
+// **footer 存在时必须经索引定位、不得假设段序**——消费方据返回的段表自行定位。
+pub func read_index(data: table<i64>) -> (bool, table<i64>, table<i64>, table<i64>, table<string>) {
+    var empty_t = table_new_i64()
+    var empty_n = table_new_string()
+    var (has, index_off, index_len, crc) = footer_probe(data)
+    if !has {
+        return (false, empty_t, empty_t, empty_t, empty_n)
+    }
+    if !is_v3(data) {
+        return (false, empty_t, empty_t, empty_t, empty_n)
+    }
+    if (header_flags(data) & (1 << 5)) == 0 {
+        return (false, empty_t, empty_t, empty_t, empty_n)
+    }
+    var n: i64 = len(data)
+    if index_off < 0 || index_len < 0 || index_off + index_len > n - 25 {
+        return (false, empty_t, empty_t, empty_t, empty_n)
+    }
+    var index_bytes = zd.slice(data, index_off, index_off + index_len)
+    if !footer_crc_ok(index_bytes, crc) {
+        return (false, empty_t, empty_t, empty_t, empty_n)
+    }
+    var (tys, offs, lens, nms, next) = decode_index(index_bytes, 0)
+    if next < 0 {
+        return (false, empty_t, empty_t, empty_t, empty_n)
+    }
+    // 段载荷须落在 [10, index_off) 内（不得与索引段/footer 重叠）
+    var cnt: i64 = len(tys)
+    var i: i64 = 0
+    while i < cnt {
+        if offs[i] < 10 || lens[i] < 0 || offs[i] + lens[i] > index_off {
+            return (false, empty_t, empty_t, empty_t, empty_n)
+        }
+        i = i + 1
+    }
+    return (true, tys, offs, lens, nms)
+}
+
+// segment_bytes：按段表第 i 段切出载荷（副本）。越界返回空表。
+pub func segment_bytes(data: table<i64>, offs: table<i64>, lens: table<i64>, i: i64) -> table<i64> {
+    if i < 0 || i >= len(offs) || i >= len(lens) {
+        return table_new_i64()
+    }
+    var o = offs[i]
+    var l = lens[i]
+    if o < 0 || l < 0 || o + l > len(data) {
+        return table_new_i64()
+    }
+    return zd.slice(data, o, o + l)
+}
+
+// find_segment：按类型（+ 名称，空串 = 不按名匹配）取第一个段载荷下标；无则 -1。
+// 消费方经索引定位（不假设段序）。
+pub func find_segment(types: table<i64>, names: table<string>, ty: i64, name: string) -> i64 {
+    var n: i64 = len(types)
+    var i: i64 = 0
+    while i < n {
+        if types[i] == ty {
+            if str_len(name) == 0 || names[i] == name {
+                return i
+            }
+        }
+        i = i + 1
+    }
+    return -1
+}
+
+// ---------- 文件接口（v3，禁写 v1） ----------
+
+// save_v3：单段数据体文件（段类型 0）→ 路径。成功 true。
+pub func save_v3(path: string, body: table<i64>, flags: i64) -> bool {
+    var types = table_new_i64()
+    var soffs = table_new_i64()
+    var slens = table_new_i64()
+    var names = table_new_string()
+    table_push(types, 0)
+    table_push(soffs, 0)
+    table_push(slens, len(body))
+    table_push(names, "")
+    var doc = assemble(flags, types, body, soffs, slens, names)
+    if len(doc) == 0 {
+        return false
+    }
+    return byte_write(path, doc)
+}
+
+// load_v3：v3 文件 → (ok, 首段数据体)。用于单段最小路径；多段用 read_segments。
+pub func load_v3(path: string) -> (bool, table<i64>) {
+    var data = byte_read(path)
+    var (ok, types, offs, lens, names) = read_index(data)
+    if !ok {
+        return (false, table_new_i64())
+    }
+    var idx = find_segment(types, names, 0, "")
+    if idx < 0 {
+        return (false, table_new_i64())
+    }
+    return (true, segment_bytes(data, offs, lens, idx))
+}
+}

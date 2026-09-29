@@ -37,6 +37,7 @@ var g_i64: table<i64>
 var g_f64: table<f64>
 var g_strs: table<string>
 var g_longenc: table<i64>
+var g_longstr: string = ""
 var g_acc: i64 = 0
 
 func mkbytes(n: i64) -> table<i64> {
@@ -218,6 +219,35 @@ func do_case(cs: string, n: i64) -> i64 {
         }
         return acc
     }
+    if cs == "strread" {
+        // 索引依赖上一轮累加值（不可折叠）+ XOR 累加，确保循环真实执行
+        var acc3: i64 = 1
+        var j4: i64 = 0
+        var ln: i64 = str_len(g_longstr)
+        while j4 < n {
+            var ix = (acc3 * 31 + j4) % ln
+            if ix < 0 {
+                ix = 0 - ix
+            }
+            acc3 = acc3 ^ (str_byte(g_longstr, ix) + 1)
+            j4 = j4 + 1
+        }
+        return acc3
+    }
+    if cs == "strslice" {
+        var ln2: i64 = str_len(g_longstr)
+        var c = str_sub_bytes(g_longstr, 0, ln2)
+        return str_len(c)
+    }
+    if cs == "lenloop" {
+        var acc2: i64 = 0
+        var j3: i64 = 0
+        while j3 < n {
+            acc2 = acc2 + len(g_raw)
+            j3 = j3 + 1
+        }
+        return acc2
+    }
     if cs == "pushloop" {
         var t = table_new_i64()
         var j2: i64 = 0
@@ -262,6 +292,7 @@ func main() {
     g_f64 = mkf64(n)
     g_strs = mkstrs(n)
     var longstr = mkstr(n)
+    g_longstr = longstr
     g_longenc = zd.encode_string(longstr)
     g_acc = g_acc + len(g_raw) + len(g_i64) + len(g_f64) + len(g_strs) + len(g_longenc)
 

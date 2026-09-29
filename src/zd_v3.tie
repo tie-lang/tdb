@@ -28,6 +28,7 @@ type tie<class>
 
 import "./zd.tie"
 import "./zd_stream.tie"
+import "./zd_ext.tie"
 import "/std/tsha1.tie"
 
 namespace zd_v3 {
@@ -757,6 +758,166 @@ pub func decode_schema(bytes: table<i64>, pos: i64) -> (bool, table<i64>, table<
         return (false, no_t, no_s, no_t, no_t, -1)
     }
     return (true, nums, names, tys, states, q)
+}
+
+// ==================== 标准类型三件（ext 固定标记） ====================
+// 对齐 zd-java ZdStandard（语言规范 §17.2）：v3 实现**强制支持**，v2 读取方按未知 ext
+// 整体跳过。ext 形态 = 0xd7 + 标记 varint + 长度 varint + 载荷（复用 zd_ext.encode_ext）。
+//   · timestamp（标记 1）：8 字节 Unix 纪元秒 i64 大端 + 4 字节纳秒 u32 大端；
+//     纳秒 ∈ [0, 999999999]。
+//   · decimal（标记 2）：[符号 1 字节][指数 i8 1 字节][十进制数字串 UTF-8]；
+//     值 = ±数字 × 10^指数；数字串 1..255 字节且全为 '0'..'9'；指数 ∈ [-128, 127]。
+//     （**字段顺序以实现为准**：符号、指数、数字——zd-java 注释写「符号+数字+指数」
+//      与代码不符，代码为权威。）
+//   · uuid（标记 3）：16 字节 RFC 4122 位模式（高 8 字节 msb + 低 8 字节 lsb）。
+// 图容器 ext 标记 0x47（47）。
+
+pub func std_tag_timestamp() -> i64 { return 1 }
+pub func std_tag_decimal() -> i64 { return 2 }
+pub func std_tag_uuid() -> i64 { return 3 }
+pub func std_tag_graph() -> i64 { return 0x47 }
+
+// ---------- timestamp ----------
+
+// encode_timestamp：纪元秒 + 纳秒 → ext(标记 1)。纳秒越界 → 空表（确定性拒绝）。
+pub func encode_timestamp(epoch_sec: i64, nano: i64) -> table<i64> {
+    if nano < 0 || nano > 999999999 {
+        return table_new_i64()
+    }
+    var p: table<i64> = [
+        (epoch_sec >> 56) & 0xFF, (epoch_sec >> 48) & 0xFF, (epoch_sec >> 40) & 0xFF,
+        (epoch_sec >> 32) & 0xFF, (epoch_sec >> 24) & 0xFF, (epoch_sec >> 16) & 0xFF,
+        (epoch_sec >> 8) & 0xFF, epoch_sec & 0xFF,
+        (nano >> 24) & 0xFF, (nano >> 16) & 0xFF, (nano >> 8) & 0xFF, nano & 0xFF]
+    return zd_ext.encode_ext(1, p)
+}
+
+// decode_timestamp：ext(标记 1) → (ok, epoch_sec, nano)。标记/长度不符 → ok=false。
+pub func decode_timestamp(ext: table<i64>) -> (bool, i64, i64) {
+    var (tag, p, nx) = zd_ext.decode_ext(ext, 0)
+    if tag != 1 || nx < 0 || len(p) != 12 {
+        return (false, 0, 0)
+    }
+    var sec: i64 = 0
+    var i: i64 = 0
+    while i < 8 {
+        sec = (sec << 8) | (p[i] & 0xFF)
+        i = i + 1
+    }
+    var nano: i64 = 0
+    i = 8
+    while i < 12 {
+        nano = (nano << 8) | (p[i] & 0xFF)
+        i = i + 1
+    }
+    if nano > 999999999 {
+        return (false, 0, 0)
+    }
+    return (true, sec, nano)
+}
+
+// ---------- decimal ----------
+
+// encode_decimal：符号 + 指数 + 数字串 → ext(标记 2)。
+// 拒绝（空表）：数字串空或 >255 字节；含非 '0'..'9'；指数越 i8 范围。
+pub func encode_decimal(negative: bool, exponent: i64, digits: string) -> table<i64> {
+    if exponent < -128 || exponent > 127 {
+        return table_new_i64()
+    }
+    var dl: i64 = len(digits)
+    if dl < 1 || dl > 255 {
+        return table_new_i64()
+    }
+    var i: i64 = 0
+    while i < dl {
+        var b = str_byte(digits, i) & 0xFF
+        if b < 0x30 || b > 0x39 {
+            return table_new_i64()   // '0'..'9'
+        }
+        i = i + 1
+    }
+    var p = table_new_i64()
+    if negative {
+        table_push(p, 1)
+    } else {
+        table_push(p, 0)
+    }
+    table_push(p, exponent & 0xFF)   // i8 两补
+    var j: i64 = 0
+    while j < dl {
+        table_push(p, str_byte(digits, j) & 0xFF)
+        j = j + 1
+    }
+    return zd_ext.encode_ext(2, p)
+}
+
+// decode_decimal：ext(标记 2) → (ok, negative, exponent, digits)。
+// 载荷过短 / 符号非 0/1 / 数字串空或含非数字 / 指数两补还原 → ok=false。
+pub func decode_decimal(ext: table<i64>) -> (bool, bool, i64, string) {
+    var (tag, p, nx) = zd_ext.decode_ext(ext, 0)
+    if tag != 2 || nx < 0 || len(p) < 3 {
+        return (false, false, 0, "")
+    }
+    var sb = p[0] & 0xFF
+    if sb != 0 && sb != 1 {
+        return (false, false, 0, "")
+    }
+    var ex: i64 = p[1] & 0xFF
+    if ex >= 0x80 {
+        ex = ex - 256   // i8 两补还原
+    }
+    var digits = ""
+    var i: i64 = 2
+    while i < len(p) {
+        var b = p[i] & 0xFF
+        if b < 0x30 || b > 0x39 {
+            return (false, false, 0, "")
+        }
+        digits = digits + str_from_code(b)
+        i = i + 1
+    }
+    if str_len(digits) == 0 {
+        return (false, false, 0, "")
+    }
+    return (true, sb == 1, ex, digits)
+}
+
+// ---------- uuid ----------
+
+// encode_uuid：msb(高 8 字节) + lsb(低 8 字节) → ext(标记 3)。
+pub func encode_uuid(msb: i64, lsb: i64) -> table<i64> {
+    var p: table<i64> = [
+        (msb >> 56) & 0xFF, (msb >> 48) & 0xFF, (msb >> 40) & 0xFF, (msb >> 32) & 0xFF,
+        (msb >> 24) & 0xFF, (msb >> 16) & 0xFF, (msb >> 8) & 0xFF, msb & 0xFF,
+        (lsb >> 56) & 0xFF, (lsb >> 48) & 0xFF, (lsb >> 40) & 0xFF, (lsb >> 32) & 0xFF,
+        (lsb >> 24) & 0xFF, (lsb >> 16) & 0xFF, (lsb >> 8) & 0xFF, lsb & 0xFF]
+    return zd_ext.encode_ext(3, p)
+}
+
+// decode_uuid：ext(标记 3) → (ok, msb, lsb)。标记/长度不符 → ok=false。
+pub func decode_uuid(ext: table<i64>) -> (bool, i64, i64) {
+    var (tag, p, nx) = zd_ext.decode_ext(ext, 0)
+    if tag != 3 || nx < 0 || len(p) != 16 {
+        return (false, 0, 0)
+    }
+    var msb: i64 = 0
+    var lsb: i64 = 0
+    var i: i64 = 0
+    while i < 8 {
+        msb = (msb << 8) | (p[i] & 0xFF)
+        lsb = (lsb << 8) | (p[8 + i] & 0xFF)
+        i = i + 1
+    }
+    return (true, msb, lsb)
+}
+
+// std_tag_of：ext 值的标记（未知/非法 → -1）。v2 读取方按未知标记整体跳过。
+pub func std_tag_of(ext: table<i64>) -> i64 {
+    var (tag, p, nx) = zd_ext.decode_ext(ext, 0)
+    if nx < 0 {
+        return -1
+    }
+    return tag
 }
 
 // ---------- 文件接口（v3，禁写 v1） ----------

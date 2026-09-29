@@ -1,6 +1,10 @@
 type tie<logic>
 // probe_zd_stream: zd_stream 流式分块 + 帧边界/CRC + 压缩变体声明 + flags 位
+// r.1.6.7：帧载体已由 table<i64> 迁移为**字符串**（1× 密度、单指令字节读）；
+// 线上字节格式不变（迁移前后逐字节比对见 tests/_golden_stream.tie）。
+// 本探针同时保留表版 crc32 的校验，并断言 crc32_str == crc32(to_table)。
 import "../src/zd.tie"
+import "../src/zbuf.tie"
 import "../src/zd_stream.tie"
 
 var fails: i64 = 0
@@ -14,7 +18,42 @@ func check(cond: bool, msg: string) {
     }
 }
 
-// 构造 "123456789" 的 ASCII 字节表（0x31..0x39）
+// 造 n 字节字符串（值 = base+i）
+func mkbytes(n: i64, base: i64) -> string {
+    var bw = string_builder()
+    var i: i64 = 0
+    while i < n {
+        sb_append_byte(bw, (base + i) & 0xFF)
+        i = i + 1
+    }
+    return sb_build(bw)
+}
+
+// 显式字节串
+func bytes_of1(a: i64) -> string {
+    var bw = string_builder()
+    sb_append_byte(bw, a & 0xFF)
+    return sb_build(bw)
+}
+
+func bytes_of3(a: i64, b: i64, c: i64) -> string {
+    var bw = string_builder()
+    sb_append_byte(bw, a & 0xFF)
+    sb_append_byte(bw, b & 0xFF)
+    sb_append_byte(bw, c & 0xFF)
+    return sb_build(bw)
+}
+
+func bytes_of4(a: i64, b: i64, c: i64, d: i64) -> string {
+    var bw = string_builder()
+    sb_append_byte(bw, a & 0xFF)
+    sb_append_byte(bw, b & 0xFF)
+    sb_append_byte(bw, c & 0xFF)
+    sb_append_byte(bw, d & 0xFF)
+    return sb_build(bw)
+}
+
+// "123456789" 的 ASCII 表（表版 crc32 用）
 func ascii_digits() -> table<i64> {
     var t = table_new_i64()
     var i: i64 = 0
@@ -25,15 +64,19 @@ func ascii_digits() -> table<i64> {
     return t
 }
 
-// 拷贝字节表
-func copy_t(t: table<i64>) -> table<i64> {
-    var out = table_new_i64()
+// 翻转字节串第 k 字节（字符串不可原地改 → 重建）
+func flip_byte(s: string, k: i64) -> string {
+    var bw = string_builder()
     var i: i64 = 0
-    while i < len(t) {
-        table_push(out, t[i])
+    while i < len(s) {
+        var b = str_byte(s, i) & 0xFF
+        if i == k {
+            b = b ^ 0x01
+        }
+        sb_append_byte(bw, b)
         i = i + 1
     }
-    return out
+    return sb_build(bw)
 }
 
 // 拼 v2 字节头：魔数 + d1 + d2 + flags
@@ -48,95 +91,100 @@ func head(flags: i64) -> table<i64> {
     table_push(h, 0x44)
     table_push(h, 0x00)
     table_push(h, 0x02)
-    table_push(h, flags)
+    table_push(h, flags & 0xFF)
     return h
 }
 
 func main() {
-    println("start")
-
-    // 1. crc32 校验向量
+    // 1. CRC32 校验向量（表版 + 字符串版必须同值）
     var digits = ascii_digits()
     check(zd_stream.crc32(digits) == 0xCBF43926, "crc32 check vector")
-    var e = table_new_i64()
+    var e: table<i64> = []
     check(zd_stream.crc32(e) == 0, "crc32 empty == 0")
     check(zd_stream.crc32([0x31]) != 0, "crc32 single byte non-zero")
+    check(zd_stream.crc32_str("123456789") == 0xCBF43926, "crc32_str check vector")
+    check(zd_stream.crc32_str("123456789") == zd_stream.crc32(digits),
+        "crc32_str == crc32(to_table)（两载体同值）")
+    check(zd_stream.crc32_str("") == 0, "crc32_str empty == 0")
 
-    // 2. chunk 往返
-    var payload: table<i64> = [0xDE, 0xAD, 0xBE, 0xEF]
+    // 2. 空 payload 帧
+    var fempty = zd_stream.chunk_encode("")
+    check(len(fempty) == 8, "empty payload frame size 8")
+
+    // 3. 单帧往返
+    var payload = bytes_of4(0xDE, 0xAD, 0xBE, 0xEF)
     var frame = zd_stream.chunk_encode(payload)
     check(len(frame) == 12, "chunk_encode frame size 12")
-    check(frame[0] == 0 && frame[1] == 0 && frame[2] == 0 && frame[3] == 4, "frame len field = 4")
+    check(zbuf.br_at(frame, 0) == 0 && zbuf.br_at(frame, 1) == 0 &&
+          zbuf.br_at(frame, 2) == 0 && zbuf.br_at(frame, 3) == 4, "frame len field = 4")
     var (p1, n1) = zd_stream.chunk_next(frame, 0)
-    check(n1 == len(frame) && len(p1) == 4 && p1[0] == 0xDE && p1[1] == 0xAD && p1[3] == 0xEF, "chunk_next roundtrip")
+    check(n1 == len(frame) && len(p1) == 4 &&
+          zbuf.br_at(p1, 0) == 0xDE && zbuf.br_at(p1, 1) == 0xAD &&
+          zbuf.br_at(p1, 3) == 0xEF, "chunk_next roundtrip")
 
-    // 3. CRC 篡改拒绝
-    var bad = copy_t(frame)
-    bad[5] = bad[5] ^ 0x01  // 翻转 payload 一个字节 → CRC 不再匹配
+    // 4. CRC 篡改 / 截断 / 越界
+    var bad = flip_byte(frame, 5)              // 翻转 payload 一字节 → CRC 不匹配
     var (p2, n2) = zd_stream.chunk_next(bad, 0)
     check(n2 < 0 && len(p2) == 0, "tampered CRC rejected")
-
-    // 4. 截断帧拒绝
-    var trunc = zd.slice(frame, 0, 10)  // 12 字节帧裁到 10
+    var trunc = zbuf.br_slice(frame, 0, 10)    // 12 字节帧裁到 10
     var (p3, n3) = zd_stream.chunk_next(trunc, 0)
     check(n3 < 0 && len(p3) == 0, "truncated frame rejected")
     var (p3b, n3b) = zd_stream.chunk_next(frame, 100)
     check(n3b < 0 && len(p3b) == 0, "chunk_next out-of-range -1")
 
-    // 5. chunk_skip 零拷贝定位
-    var sp = zd_stream.chunk_skip(frame, 0)
-    check(sp == len(frame), "chunk_skip locates end")
-    var sp2 = zd_stream.chunk_skip(bad, 0)
-    check(sp2 == len(frame), "chunk_skip no CRC (tampered still skips)")
-    var sp3 = zd_stream.chunk_skip(frame, 100)
-    check(sp3 < 0, "chunk_skip out-of-range -1")
+    // 5. chunk_skip 定位
+    check(zd_stream.chunk_skip(frame, 0) == len(frame), "chunk_skip locates end")
+    check(zd_stream.chunk_skip(bad, 0) == len(frame), "chunk_skip no CRC (tampered still skips)")
+    check(zd_stream.chunk_skip(frame, 100) < 0, "chunk_skip out-of-range -1")
 
-    // 6. 空 payload 帧
-    var fempty = zd_stream.chunk_encode(e)
-    check(len(fempty) == 8, "empty payload frame size 8")
+    // 6. 空 payload 往返
     var (pe, ne) = zd_stream.chunk_next(fempty, 0)
     check(ne == 8 && len(pe) == 0, "empty payload roundtrip")
 
-    // 7. 多帧顺序解析
-    var pa: table<i64> = [0x11]
-    var pb: table<i64> = [0x22, 0x33, 0x44]
-    var pc: table<i64> = [0x55, 0x66, 0x77, 0x88, 0x99]
-    var chunks: table<table<i64>> = [pa, pb, pc]
+    // 7. 多帧组装 + 迭代 + 手工定位
+    var pa = bytes_of1(0x11)
+    var pb = bytes_of3(0x22, 0x33, 0x44)
+    var chunks = table_new_string()
+    table_push(chunks, pa)
+    table_push(chunks, pb)
+    table_push(chunks, mkbytes(5, 0x55))
     var stream = zd_stream.chunks_concat(chunks)
     check(len(stream) == 33, "chunks_concat stream size 33")
     var (plist, nend) = zd_stream.chunks_iter(stream, 0)
     check(nend == len(stream) && len(plist) == 3, "chunks_iter parses 3 frames to end")
-    check(len(plist[0]) == 1 && plist[0][0] == 0x11, "frame0 payload")
-    check(len(plist[1]) == 3 && plist[1][0] == 0x22 && plist[1][2] == 0x44, "frame1 payload")
-    check(len(plist[2]) == 5 && plist[2][0] == 0x55 && plist[2][4] == 0x99, "frame2 payload")
-    // 逐帧手推偏移：9 → 20 → 33
+    check(len(plist[0]) == 1 && zbuf.br_at(plist[0], 0) == 0x11, "frame0 payload")
+    check(len(plist[1]) == 3 && zbuf.br_at(plist[1], 0) == 0x22 &&
+          zbuf.br_at(plist[1], 2) == 0x44, "frame1 payload")
+    check(len(plist[2]) == 5 && zbuf.br_at(plist[2], 0) == 0x55 &&
+          zbuf.br_at(plist[2], 4) == 0x59, "frame2 payload")
     var (f0, nf0) = zd_stream.chunk_next(stream, 0)
-    check(nf0 == 9 && f0[0] == 0x11, "manual frame0 next=9")
+    check(nf0 == 9 && zbuf.br_at(f0, 0) == 0x11, "manual frame0 next=9")
     var (f1, nf1) = zd_stream.chunk_next(stream, nf0)
-    check(nf1 == 20 && f1[2] == 0x44, "manual frame1 next=20")
+    check(nf1 == 20 && zbuf.br_at(f1, 2) == 0x44, "manual frame1 next=20")
     var (f2, nf2) = zd_stream.chunk_next(stream, nf1)
-    check(nf2 == len(stream) && f2[4] == 0x99, "manual frame2 next=len")
-    // chunk_skip 逐帧定位
+    check(nf2 == len(stream) && zbuf.br_at(f2, 4) == 0x59, "manual frame2 next=len")
     var s0 = zd_stream.chunk_skip(stream, 0)
     var s1 = zd_stream.chunk_skip(stream, s0)
-    check(s0 == 9 && s1 == 20 && zd_stream.chunk_skip(stream, s1) == len(stream), "chunk_skip chained offsets")
-    // 末位起解析 → 空流
+    check(s0 == 9 && s1 == 20 && zd_stream.chunk_skip(stream, s1) == len(stream),
+        "chunk_skip chained offsets")
     var (plast, nlast) = zd_stream.chunks_iter(stream, len(stream))
     check(nlast == len(stream) && len(plast) == 0, "chunks_iter at end returns empty")
 
     // 8. 压缩变体声明往返
-    var body: table<i64> = [1, 2, 3, 4, 5]
+    var body = mkbytes(5, 1)                       // [1,2,3,4,5]
     var c1 = zd_stream.encode_compressed(body, 1)  // zstd
-    check(len(c1) == 7 && c1[0] == 0xC9 && c1[1] == 1, "encode_compressed zstd tag")
+    check(len(c1) == 7 && zbuf.br_at(c1, 0) == 0xC9 && zbuf.br_at(c1, 1) == 1,
+        "encode_compressed zstd tag")
     var (a1, b1, nb1) = zd_stream.decode_compressed(c1, 0)
-    check(a1 == 1 && nb1 == len(c1) && len(b1) == 5 && b1[4] == 5, "decode_compressed zstd roundtrip")
+    check(a1 == 1 && nb1 == len(c1) && len(b1) == 5 && zbuf.br_at(b1, 4) == 5,
+        "decode_compressed zstd roundtrip")
     var c2 = zd_stream.encode_compressed(body, 2)  // lz4
     var (a2, b2, nb2) = zd_stream.decode_compressed(c2, 0)
-    check(a2 == 2 && nb2 == len(c2) && len(b2) == 5 && b2[0] == 1, "decode_compressed lz4 roundtrip")
+    check(a2 == 2 && nb2 == len(c2) && len(b2) == 5 && zbuf.br_at(b2, 0) == 1,
+        "decode_compressed lz4 roundtrip")
     var c0 = zd_stream.encode_compressed(body, 0)  // 无
     var (a0, b0, nb0) = zd_stream.decode_compressed(c0, 0)
     check(a0 == 0 && nb0 == len(c0) && len(b0) == 5, "decode_compressed none roundtrip")
-    // 非 0xC9 前缀拒绝（帧首字节是 len，非 0xC9）
     var (an, bn, nn) = zd_stream.decode_compressed(frame, 0)
     check(an < 0 && len(bn) == 0 && nn < 0, "decode_compressed rejects non-0xC9")
 
@@ -151,7 +199,8 @@ func main() {
     var h0 = head(0)
     var (hv0, hl0, hf0) = zd.header_info(h0)
     check(hv0 == 2 && hl0 == 10 && hf0 == 0, "v2 header flags=0")
-    check((hf0 & zd_stream.stream_flag()) == 0 && (hf0 & zd_stream.compress_flag()) == 0, "no bits when flags=0")
+    check((hf0 & zd_stream.stream_flag()) == 0 && (hf0 & zd_stream.compress_flag()) == 0,
+        "no bits when flags=0")
 
     if fails == 0 {
         println("PASS all")

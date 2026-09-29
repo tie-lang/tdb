@@ -18,6 +18,7 @@ type tie<class>
 //   stream_flag / compress_flag。
 
 import "./zd.tie"
+import "./zbuf.tie"
 
 namespace zd_stream {
 
@@ -44,105 +45,100 @@ pub func crc32(bytes: table<i64>) -> i64 {
     return c ^ 0xFFFFFFFF
 }
 
-// ---------- 流式分块帧 ----------
-// chunk_encode：payload → 完整帧字节（len u32 BE + payload + crc u32 BE）。
-// 字节一律规范化为 0..255（& 0xFF）。
-pub func chunk_encode(payload: table<i64>) -> table<i64> {
-    var out = table_new_i64()
-    var n: i64 = len(payload)
-    table_push(out, (n >> 24) & 0xFF)
-    table_push(out, (n >> 16) & 0xFF)
-    table_push(out, (n >> 8) & 0xFF)
-    table_push(out, n & 0xFF)
+// crc32_str：同一 CRC32-IEEE 算法作用于**字符串载体**（r.1.6.7 字节缓冲抽象）。
+// 逐位无表实现与表版逐位一致；`str_byte` 单指令（实测 6ns）vs 表 `t[i]`（27–28ns）
+// ⇒ 同一载荷下字符串载体明显更快，且内存 1× vs 8×。
+// 与 `crc32(table<i64>)` **必须逐位同值**（探针 probe_zbuf 交叉断言）。
+pub func crc32_str(s: string) -> i64 {
+    var c: i64 = 0xFFFFFFFF
+    var n: i64 = len(s)
     var i: i64 = 0
     while i < n {
-        table_push(out, payload[i] & 0xFF)
+        c = c ^ (str_byte(s, i) & 0xFF)
+        var k: i64 = 0
+        while k < 8 {
+            var lsb: i64 = c & 1
+            c = c >> 1
+            if lsb != 0 {
+                c = c ^ 0xEDB88320
+            }
+            k = k + 1
+        }
         i = i + 1
     }
-    var c: i64 = crc32(payload)
-    table_push(out, (c >> 24) & 0xFF)
-    table_push(out, (c >> 16) & 0xFF)
-    table_push(out, (c >> 8) & 0xFF)
-    table_push(out, c & 0xFF)
-    return out
+    return c ^ 0xFFFFFFFF
 }
 
-// chunk_next：从 bytes[pos..] 解析一帧 → (payload, next_pos)；失败 (空表, -1)。
+// ---------- 流式分块帧（r.1.6.7：**字符串载体**） ----------
+// 载体说明：payload/帧/流一律用 tie **字符串**（字节密度 1×、`str_byte` 单指令、
+// `sb_append` 按字节 memcpy），替代 `table<i64>`（8×、逐元素索引走容器锁）。
+// **线上字节格式完全不变**（迁移前后逐字节比对通过，见 tests/_golden_stream.tie）。
+// 一处顺带的实质改进：旧版 `chunk_encode` 把 payload **逐元素 push** 进新表
+// （每字节一次 `table_push`），现改为 `bw_put_bytes` **单次 memcpy**；
+// `chunk_next` 取 payload 也从逐元素拷贝改为 `str_sub_bytes` **单次切片拷贝**。
+
+// chunk_encode：payload → 完整帧字节（len u32 BE + payload + crc u32 BE）。
+pub func chunk_encode(payload: string) -> string {
+    var bw = zbuf.bw_new()
+    zbuf.bw_put_u32_be(bw, len(payload))
+    zbuf.bw_put_bytes(bw, payload)          // 单次 memcpy（旧版为逐元素 push）
+    zbuf.bw_put_u32_be(bw, crc32_str(payload))
+    return zbuf.bw_build(bw)
+}
+
+// chunk_next：从 bytes[pos..] 解析一帧 → (payload, next_pos)；失败 ("", -1)。
 // 严格校验 CRC；len 声称的字节越界亦拒绝。
-pub func chunk_next(bytes: table<i64>, pos: i64) -> (table<i64>, i64) {
-    var empty = table_new_i64()
+pub func chunk_next(bytes: string, pos: i64) -> (string, i64) {
     var nb: i64 = len(bytes)
-    if pos < 0 {
-        return (empty, -1)
+    if pos < 0 || pos + 8 > nb {
+        return ("", -1)
     }
-    if pos + 7 >= nb {
-        return (empty, -1)
+    var (n, p1) = zbuf.br_u32_be(bytes, pos)
+    if p1 < 0 || n < 0 || pos + 8 + n > nb {
+        return ("", -1)
     }
-    var n: i64 = ((bytes[pos] & 0xFF) << 24) | ((bytes[pos + 1] & 0xFF) << 16) |
-        ((bytes[pos + 2] & 0xFF) << 8) | (bytes[pos + 3] & 0xFF)
-    if n < 0 {
-        return (empty, -1)
+    var payload = zbuf.br_slice(bytes, pos + 4, pos + 4 + n)   // 单次切片拷贝
+    var (c, p2) = zbuf.br_u32_be(bytes, pos + 4 + n)
+    if p2 < 0 {
+        return ("", -1)
     }
-    if pos + 8 + n > nb {
-        return (empty, -1)
-    }
-    var payload = table_new_i64()
-    var i: i64 = 0
-    while i < n {
-        table_push(payload, bytes[pos + 4 + i] & 0xFF)
-        i = i + 1
-    }
-    var c: i64 = ((bytes[pos + 4 + n] & 0xFF) << 24) | ((bytes[pos + 5 + n] & 0xFF) << 16) |
-        ((bytes[pos + 6 + n] & 0xFF) << 8) | (bytes[pos + 7 + n] & 0xFF)
-    if crc32(payload) != c {
-        return (empty, -1)
+    if crc32_str(payload) != c {
+        return ("", -1)
     }
     return (payload, pos + 8 + n)
 }
 
 // chunk_skip：零拷贝跳过一帧 → next_pos；失败 -1。不校验 CRC，适合大 payload
 // 只读不拷、或批量帧快速定位（zd v2 偏移表思路的帧级版）。
-pub func chunk_skip(bytes: table<i64>, pos: i64) -> i64 {
+pub func chunk_skip(bytes: string, pos: i64) -> i64 {
     var nb: i64 = len(bytes)
-    if pos < 0 {
+    if pos < 0 || pos + 8 > nb {
         return -1
     }
-    if pos + 7 >= nb {
-        return -1
-    }
-    var n: i64 = ((bytes[pos] & 0xFF) << 24) | ((bytes[pos + 1] & 0xFF) << 16) |
-        ((bytes[pos + 2] & 0xFF) << 8) | (bytes[pos + 3] & 0xFF)
-    if n < 0 {
-        return -1
-    }
-    if pos + 8 + n > nb {
+    var (n, p1) = zbuf.br_u32_be(bytes, pos)
+    if p1 < 0 || n < 0 || pos + 8 + n > nb {
         return -1
     }
     return pos + 8 + n
 }
 
 // ---------- 多帧组装 ----------
-// chunks_concat：payload 表 → 每块各自成帧，串接为流（表<table<i64>> 元素为 payload）。
-pub func chunks_concat(chunks: table<table<i64>>) -> table<i64> {
-    var out = table_new_i64()
+// chunks_concat：各 payload（字符串，各自为一段字节）→ 各自成帧后串接为流。
+pub func chunks_concat(chunks: table<string>) -> string {
+    var bw = zbuf.bw_new()
     var n: i64 = len(chunks)
     var i: i64 = 0
     while i < n {
-        var f: table<i64> = chunk_encode(chunks[i])
-        var j: i64 = 0
-        while j < len(f) {
-            table_push(out, f[j])
-            j = j + 1
-        }
+        zbuf.bw_put_bytes(bw, chunk_encode(chunks[i]))   // 帧整体 memcpy 追加
         i = i + 1
     }
-    return out
+    return zbuf.bw_build(bw)
 }
 
 // chunks_iter：按 chunk_next 循环取帧，收集各 payload → (payloads, next_pos)。
 // 任取帧失败返回 (已收集, -1)；流恰好耗尽时 next_pos == len(bytes)。
-pub func chunks_iter(bytes: table<i64>, pos: i64) -> (table<table<i64>>, i64) {
-    var out: table<table<i64>> = []
+pub func chunks_iter(bytes: string, pos: i64) -> (table<string>, i64) {
+    var out = table_new_string()
     var p: i64 = pos
     var nb: i64 = len(bytes)
     while p < nb {
@@ -158,37 +154,26 @@ pub func chunks_iter(bytes: table<i64>, pos: i64) -> (table<table<i64>>, i64) {
 
 // ---------- 压缩变体声明（只声明，不解压） ----------
 // encode_compressed：body → [0xC9][algo][body]。algo：0=无 / 1=zstd / 2=lz4。
-pub func encode_compressed(body: table<i64>, algo: i64) -> table<i64> {
-    var out = table_new_i64()
-    table_push(out, 0xC9)
-    table_push(out, algo & 0xFF)
-    var i: i64 = 0
-    while i < len(body) {
-        table_push(out, body[i] & 0xFF)
-        i = i + 1
-    }
-    return out
+pub func encode_compressed(body: string, algo: i64) -> string {
+    var bw = zbuf.bw_new()
+    zbuf.bw_put_u8(bw, 0xC9)
+    zbuf.bw_put_u8(bw, algo)
+    zbuf.bw_put_bytes(bw, body)
+    return zbuf.bw_build(bw)
 }
 
 // decode_compressed：读回变体声明 → (algo, body, next_pos)；非 0xC9 前缀失败
-// (-1, 空表, -1)。读端据 algo 自行接 zstd/lz4 解压。
-pub func decode_compressed(bytes: table<i64>, pos: i64) -> (i64, table<i64>, i64) {
-    var empty = table_new_i64()
-    if (zd.u8_at(bytes, pos) & 0xFF) != 0xC9 {
-        return (-1, empty, -1)
+// (-1, "", -1)。读端据 algo 自行接 zstd/lz4 解压。
+pub func decode_compressed(bytes: string, pos: i64) -> (i64, string, i64) {
+    if zbuf.br_at(bytes, pos) != 0xC9 {
+        return (-1, "", -1)
     }
-    var algo: i64 = zd.u8_at(bytes, pos + 1) & 0xFF
-    if algo < 0 {
-        return (-1, empty, -1)
+    var nb: i64 = len(bytes)
+    if pos + 2 > nb {
+        return (-1, "", -1)
     }
-    var body = table_new_i64()
-    var n: i64 = len(bytes)
-    var i: i64 = pos + 2
-    while i < n {
-        table_push(body, bytes[i] & 0xFF)
-        i = i + 1
-    }
-    return (algo, body, n)
+    var algo = zbuf.br_at(bytes, pos + 1)
+    return (algo, zbuf.br_slice(bytes, pos + 2, nb), nb)
 }
 
 // ---------- 头部 flags 位（配合 zd.header_info 判定流式/压缩） ----------

@@ -26,6 +26,7 @@ type tie<logic>
 //   offtab    encode_with_offsets(scale 项)
 
 import "../src/zd.tie"
+import "../src/zbuf.tie"
 import "../src/zd_extra.tie"
 import "../src/zd_ext.tie"
 import "../src/zd_stream.tie"
@@ -33,6 +34,7 @@ import "../src/zd_builder.tie"
 
 // ---------- 全局数据（main 构造，do_case 消费） ----------
 var g_raw: table<i64>
+var g_raws: string = ""   // r.1.6.7：同一载荷的字符串载体（chunk 帧用例用）
 var g_i64: table<i64>
 var g_f64: table<f64>
 var g_strs: table<string>
@@ -261,7 +263,8 @@ func do_case(cs: string, n: i64) -> i64 {
         return zd_stream.crc32(g_raw)
     }
     if cs == "chunk" {
-        var e5 = zd_stream.chunk_encode(g_raw)
+        // r.1.6.7：chunk_encode 已迁到字符串载体
+        var e5 = zd_stream.chunk_encode(g_raws)
         return len(e5)
     }
     if cs == "offtab" {
@@ -288,6 +291,7 @@ func main() {
 
     // 构造（一次）
     g_raw = mkbytes(n)
+    g_raws = zbuf.from_table(g_raw)
     g_i64 = mki64(n)
     g_f64 = mkf64(n)
     g_strs = mkstrs(n)

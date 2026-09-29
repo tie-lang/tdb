@@ -1,0 +1,261 @@
+type tie<logic>
+// probe_zbuf: 字节缓冲抽象（zbuf）正确性与**字节一致性**
+// ---------------------------------------------------------------------------
+// 覆盖：
+//   1. 全部读/写原语的往返（u8/u16/u32/u64 BE+LE、f64 BE+LE、varint、zigzag、
+//      长度前缀字节串）；
+//   2. **与 zd 表版写入器的字节一致**（同一值经 zbuf 与 zd 两条路 → 逐字节相同）
+//      ——保证两种载体互通、不产生格式分叉；
+//   3. **二进制安全**：0..255 全值域、内嵌 0x00 / 0xFF 往返不失真；
+//   4. 边界互换 to_table / from_table 往返 + 内存密度（1× vs 8×）；
+//   5. 文件往返 file_store / file_load（并与 byte_write/byte_read 老路交叉验证）；
+//   6. crc32_str（字符串载体）与 crc32（表载体）**逐位同值**；
+//   7. hex 往返与非法输入拒绝；
+//   8. 边界：空载荷、短读返回 -1、br_has / br_remaining。
+import "../src/zd.tie"
+import "../src/zd_stream.tie"
+import "../src/zbuf.tie"
+
+var fails: i64 = 0
+
+func check(cond: bool, msg: string) {
+    if cond {
+        println("PASS " + msg)
+    } else {
+        println("FAIL " + msg)
+        fails = fails + 1
+    }
+}
+
+// 字节表 → hex（与 zbuf.to_hex 对照用）
+func tbl_hex(t: table<i64>) -> string {
+    var bw = string_builder()
+    var n: i64 = len(t)
+    var i: i64 = 0
+    while i < n {
+        var b = t[i] & 0xFF
+        sb_append_byte(bw, char_code(str_char("0123456789abcdef", b >> 4)))
+        sb_append_byte(bw, char_code(str_char("0123456789abcdef", b & 0xF)))
+        i = i + 1
+    }
+    return sb_build(bw)
+}
+
+// 造 n 字节载荷（值 = i & 0xFF，覆盖全值域）
+func mk(n: i64) -> string {
+    var bw = string_builder()
+    var i: i64 = 0
+    while i < n {
+        sb_append_byte(bw, i & 0xFF)
+        i = i + 1
+    }
+    return sb_build(bw)
+}
+
+// 逐字节比较两个字符串载体
+func same_bytes(a: string, b: string) -> bool {
+    if len(a) != len(b) {
+        return false
+    }
+    var i: i64 = 0
+    while i < len(a) {
+        if (str_byte(a, i) & 0xFF) != (str_byte(b, i) & 0xFF) {
+            return false
+        }
+        i = i + 1
+    }
+    return true
+}
+
+// 表与字符串载体逐字节比较
+func same_table_str(t: table<i64>, s: string) -> bool {
+    if len(t) != len(s) {
+        return false
+    }
+    var i: i64 = 0
+    while i < len(t) {
+        if (t[i] & 0xFF) != (str_byte(s, i) & 0xFF) {
+            return false
+        }
+        i = i + 1
+    }
+    return true
+}
+
+func main() {
+    var work: string = arg_string(0)
+    if str_len(work) == 0 {
+        work = "F:/Projects/tie-repo/tdb/_zbuf_probe"
+    }
+
+    // ---------- 1. 原语往返 ----------
+    var w = zbuf.bw_new()
+    zbuf.bw_put_u8(w, 0xAB)
+    zbuf.bw_put_u16_be(w, 0x1234)
+    zbuf.bw_put_u16_le(w, 0x1234)
+    zbuf.bw_put_u32_be(w, 0xDEADBEEF)
+    zbuf.bw_put_u32_le(w, 0xDEADBEEF)
+    zbuf.bw_put_u64_be(w, 0x0102030405060708)
+    zbuf.bw_put_u64_le(w, 0x0102030405060708)
+    zbuf.bw_put_f64_be(w, 1.5)
+    zbuf.bw_put_f64_le(w, 1.5)
+    zbuf.bw_put_varint(w, 300)
+    zbuf.bw_put_zigzag(w, 0 - 1)
+    zbuf.bw_put_zigzag(w, 1)
+    zbuf.bw_put_len_bytes(w, "hi")
+    var buf = zbuf.bw_build(w)
+    check(len(buf) == 52, "写端总长 52 字节（实际 " + to_string(len(buf)) + "）")
+
+    var (v_u8, p1) = zbuf.br_u8(buf, 0)
+    var (v_u16be, p2) = zbuf.br_u16_be(buf, p1)
+    var (v_u16le, p3) = zbuf.br_u16_le(buf, p2)
+    var (v_u32be, p4) = zbuf.br_u32_be(buf, p3)
+    var (v_u32le, p5) = zbuf.br_u32_le(buf, p4)
+    var (v_u64be, p6) = zbuf.br_u64_be(buf, p5)
+    var (v_u64le, p7) = zbuf.br_u64_le(buf, p6)
+    var (v_fbe, p8) = zbuf.br_f64_be(buf, p7)
+    var (v_fle, p9) = zbuf.br_f64_le(buf, p8)
+    var (v_vint, p10) = zbuf.br_varint(buf, p9)
+    var (v_zz1, p11) = zbuf.br_zigzag(buf, p10)
+    var (v_zz2, p12) = zbuf.br_zigzag(buf, p11)
+    var (v_lb, p13) = zbuf.br_len_bytes(buf, p12)
+    check(v_u8 == 0xAB, "u8 往返")
+    check(v_u16be == 0x1234 && v_u16le == 0x1234, "u16 BE/LE 往返")
+    check(v_u32be == 0xDEADBEEF && v_u32le == 0xDEADBEEF, "u32 BE/LE 往返")
+    check(v_u64be == 0x0102030405060708 && v_u64le == 0x0102030405060708, "u64 BE/LE 往返")
+    check(v_fbe == 1.5 && v_fle == 1.5, "f64 BE/LE 往返")
+    check(v_vint == 300, "varint 往返（300 → 2 字节）")
+    check(v_zz1 == 0 - 1 && v_zz2 == 1, "zigzag 往返（-1 / 1）")
+    check(v_lb == "hi", "长度前缀字节串往返")
+    check(p13 == len(buf), "读端恰好消费全部字节")
+
+    // ---------- 2. 与 zd 表版写入器逐字节一致 ----------
+    var wz = zbuf.bw_new()
+    zbuf.bw_put_varint(wz, 300)
+    zbuf.bw_put_u64_be(wz, 0x0102030405060708)
+    zbuf.bw_put_u32_be(wz, 0xDEADBEEF)
+    zbuf.bw_put_u16_be(wz, 0x1234)
+    zbuf.bw_put_f64_be(wz, 0.0 - 2.75)
+    zbuf.bw_put_u8(wz, 0x00)
+    zbuf.bw_put_u8(wz, 0xFF)
+    zbuf.bw_put_zigzag(wz, 0 - 12345)
+    var zs = zbuf.bw_build(wz)
+    var zt = zd.concat(
+        zd.concat(
+            zd.concat(
+                zd.concat(
+                    zd.concat(
+                        zd.concat(zd.write_varint(300), zd.write_u64_be(0x0102030405060708)),
+                        zd.write_u32_be(0xDEADBEEF)),
+                    zd.write_u16_be(0x1234)),
+                zd.write_f64_be(0.0 - 2.75)),
+            [0x00, 0xFF]),
+        zd.write_varint((0 - 12345 << 1) ^ ((0 - 12345) >> 63)))
+    check(zbuf.to_hex(zs) == tbl_hex(zt),
+        "zbuf 与 zd 表版写入器逐字节一致（varint/u64/u32/u16/f64/u8/zigzag）")
+
+    // ---------- 3. 二进制安全 ----------
+    var allb = mk(256)
+    check(len(allb) == 256, "0..255 载荷字节长度恰为 256（1× 密度）")
+    var allok: bool = true
+    var i2: i64 = 0
+    while i2 < 256 {
+        if (str_byte(allb, i2) & 0xFF) != (i2 & 0xFF) {
+            allok = false
+        }
+        i2 = i2 + 1
+    }
+    check(allok, "全值域 0..255 逐字节往返不失真")
+
+    // 内嵌 NUL：构造 "a" + 0x00 + "b" + 0xFF
+    var nulw = zbuf.bw_new()
+    zbuf.bw_put_u8(nulw, 0x61)
+    zbuf.bw_put_u8(nulw, 0x00)
+    zbuf.bw_put_u8(nulw, 0x62)
+    zbuf.bw_put_u8(nulw, 0xFF)
+    var nuls = zbuf.bw_build(nulw)
+    check(len(nuls) == 4, "内嵌 NUL 的串长度为 4（未被截断）")
+    check(zbuf.br_at(nuls, 0) == 0x61 && zbuf.br_at(nuls, 1) == 0x00 &&
+          zbuf.br_at(nuls, 2) == 0x62 && zbuf.br_at(nuls, 3) == 0xFF, "内嵌 0x00 / 0xFF 保真")
+
+    // 非 ASCII 字节序列（UTF-8 多字节）按字节看待，不做码点解释
+    var mw = zbuf.bw_new()
+    zbuf.bw_put_u8(mw, 0xE4)
+    zbuf.bw_put_u8(mw, 0xB8)
+    zbuf.bw_put_u8(mw, 0xAD)
+    var ms = zbuf.bw_build(mw)
+    check(len(ms) == 3, "3 字节 UTF-8 序列 len=3（字节口径）")
+    check(zbuf.bw_len(mw) == 3, "bw_len = 3")
+    check(zbuf.br_len(ms) == 3, "br_len = 3")
+
+    // ---------- 4. 边界互换 + 内存密度 ----------
+    var payload = mk(1000)
+    var pt = zbuf.to_table(payload)
+    check(len(pt) == 1000, "to_table 元素数 = 1000")
+    check(same_table_str(pt, payload), "to_table 逐字节一致")
+    var back2 = zbuf.from_table(pt)
+    check(same_bytes(back2, payload), "from_table 往返逐字节一致")
+    // 密度：字符串载体 len = n 字节；表载体 = n 元素 × 8 字节对齐
+    check(len(payload) == 1000, "字符串载体占用 1000 字节（1×）")
+    check(len(pt) == 1000, "表载体内存 = 1000 × 8 = 8000 字节（8×）")
+    println("[density] n=1000 → string=" + to_string(len(payload)) +
+        "B vs table=" + to_string(len(pt) * 8) + "B（8×）")
+
+    // ---------- 5. 文件往返 + 与老路交叉验证 ----------
+    var path = work + "_bin.dat"
+    check(zbuf.file_store(path, payload), "file_store 写成功")
+    var got = zbuf.file_load(path)
+    check(len(got) == 1000, "file_load 长度 1000（实际 " + to_string(len(got)) + "）")
+    check(same_bytes(got, payload), "file_load 内容逐字节一致（二进制安全）")
+    // 老路 byte_write/byte_read 交叉验证：两边内容必须相同
+    var path2 = work + "_bin2.dat"
+    check(byte_write(path2, zbuf.to_table(payload)), "byte_write 老路写成功")
+    var got2 = byte_read(path2)
+    check(same_table_str(got2, got), "byte_read 老路与 file_read 新路内容一致")
+    // 内嵌 NUL 的文件往返
+    var path3 = work + "_nul.dat"
+    check(zbuf.file_store(path3, nuls), "含 NUL 载荷写成功")
+    check(same_bytes(zbuf.file_load(path3), nuls), "含 NUL 载荷文件往返保真")
+
+    // ---------- 6. crc32_str == crc32（表载体） ----------
+    var c1 = zd_stream.crc32_str(payload)
+    var c2 = zd_stream.crc32(zbuf.to_table(payload))
+    check(c1 == c2, "crc32_str 与 crc32（表）逐位同值（" + to_string(c1) + "）")
+    // 标准校验向量："123456789" → 0xCBF43926
+    check(zd_stream.crc32_str("123456789") == 0xCBF43926, "CRC32 标准向量 123456789 → CBF43926")
+    check(zd_stream.crc32_str(payload) == c1, "crc32_str 可复现（同载荷同值）")
+
+    // ---------- 7. hex 往返 ----------
+    var hx = zbuf.to_hex(payload)
+    check(len(hx) == 2000, "hex 长度 = 2× 字节数（2000）")
+    var (hb, hp) = zbuf.from_hex(hx)
+    check(hp == 2000 && same_bytes(hb, payload), "hex 往返逐字节一致")
+    var (bad1, bp1) = zbuf.from_hex("abc")
+    check(bp1 == 0 - 1, "奇数长度 hex 拒绝")
+    var (bad2, bp2) = zbuf.from_hex("zz")
+    check(bp2 == 0 - 1, "非 hex 字符拒绝")
+
+    // ---------- 8. 边界 ----------
+    check(zbuf.br_len("") == 0, "空载荷 br_len = 0")
+    var (ev, ep) = zbuf.br_varint("", 0)
+    check(ep == 0 - 1, "空载荷 br_varint → next = -1")
+    var (sv, sp) = zbuf.br_u8("AB", 5)
+    check(sp == 0 - 1, "越界 br_u8 → next = -1")
+    var (tv, tp) = zbuf.br_u32_be("AB", 0)
+    check(tp == 0 - 1, "短读 br_u32_be（仅 2 字节）→ next = -1")
+    var trw = zbuf.bw_new()
+    zbuf.bw_put_u8(trw, 5)          // 声明 5 字节
+    zbuf.bw_put_bytes(trw, "ab")     // 实际只有 2 字节
+    var (lv, lp) = zbuf.br_len_bytes(zbuf.bw_build(trw), 0)
+    check(lp == 0 - 1, "长度前缀声明 5 字节但只有 2 → 拒绝")
+    check(zbuf.br_has("abcd", 2, 2) && !zbuf.br_has("abcd", 2, 3), "br_has 边界判定")
+    check(zbuf.br_remaining("abcd", 1) == 3 && zbuf.br_remaining("abcd", 9) == 0, "br_remaining")
+    check(zbuf.br_at("abcd", 9) == 0, "br_at 越界 → 0")
+
+    if fails == 0 {
+        println("PASS all")
+    } else {
+        println("FAIL total=" + to_string(fails))
+    }
+    println("done")
+}

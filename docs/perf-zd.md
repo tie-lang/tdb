@@ -1,5 +1,11 @@
 # zd 性能审计与基准 / zd Performance Audit & Benchmarks
 
+> 平台级（语言/运行时/编译器）问题与完整建议路线图见
+> `trm-lite/docs/2026-09-29-tie-dataplane-perf-report.md`——本文只覆盖 **zd 侧**。
+>
+> Platform-level findings (language / runtime / compiler) and the full roadmap live in
+> `trm-lite/docs/2026-09-29-tie-dataplane-perf-report.md`; this document covers the **zd side** only.
+
 * 日期 / Date: 2026-09-29
 * 探针 / Probes: `tests/probe_zd_perf.tie`（吞吐）、`tests/bench.sh`（斜率法差值计时）
 * 结论摘要 / TL;DR: zd 侧已落地 5 项优化（编码路径 >100×、f64 2.7×、池查询 23.7×）；

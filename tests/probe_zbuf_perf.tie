@@ -1,0 +1,152 @@
+type tie<logic>
+// probe_zbuf_perf: 字节载体（字符串 1×）vs 表载体（table<i64> 8×）吞吐对比
+// ---------------------------------------------------------------------------
+// 用法：probe_zbuf_perf <case> <n> <rep> [path]
+// case:
+//   mk_str          构造 n 字节字符串（sb_append_byte × n）
+//   mk_table        构造 n 字节表（table_push × n）
+//   scan_str        扫描预建字符串 n 字节（str_byte）
+//   scan_table      扫描预建表 n 字节（t[i]）
+//   crc_str         CRC32 预建字符串（crc32_str）
+//   crc_table       CRC32 预建表（crc32）
+//   conv_to_table   字符串 → 表（n 次 table_push）
+//   conv_from_table 表 → 字符串（n 次 sb_append_byte）
+//   fread_str       file_read(path)  × rep（1× 载体）
+//   fread_table     byte_read(path)  × rep（8× + 逐字节零扩展）
+//   noop            同形空转（供差值法扣除固定成本）
+//   hold_str        （n 字节载荷建于字符串载体后空转 ~2s；供外部采样峰值内存）
+//   hold_table      （同上，建于表载体）
+// 计时一律外部（tie 只有秒级时间源）；数据预建在计时循环之外。
+import "../src/zd.tie"
+import "../src/zd_stream.tie"
+import "../src/zbuf.tie"
+
+var g_payload: string = ""
+var g_pt: table<i64> = []
+var g_acc: i64 = 0
+
+// 造 n 字节载荷（值 = i & 0xFF）
+func mk(n: i64) -> string {
+    var bw = string_builder()
+    var i: i64 = 0
+    while i < n {
+        sb_append_byte(bw, i & 0xFF)
+        i = i + 1
+    }
+    return sb_build(bw)
+}
+
+// 构造字符串（每轮新建）
+func op_mk_str(n: i64) -> i64 {
+    var s = mk(n)
+    return len(s)
+}
+
+// 构造表（每轮新建）
+func op_mk_table(n: i64) -> i64 {
+    var t = table_new_i64()
+    var i: i64 = 0
+    while i < n {
+        table_push(t, i & 0xFF)
+        i = i + 1
+    }
+    return len(t)
+}
+
+// 扫描字符串（防折叠：下标依赖累加值、异或混合）
+func scan_str(s: string, n: i64, seed: i64) -> i64 {
+    var acc: i64 = seed
+    var i: i64 = 0
+    while i < n {
+        acc = acc ^ ((str_byte(s, (acc * 31 + i) % n) & 0xFF) + 1)
+        i = i + 1
+    }
+    return acc
+}
+
+// 扫描表（同形，唯一差别是 t[i] 走容器锁）
+func scan_table(t: table<i64>, n: i64, seed: i64) -> i64 {
+    var acc: i64 = seed
+    var i: i64 = 0
+    while i < n {
+        acc = acc ^ ((t[(acc * 31 + i) % n] & 0xFF) + 1)
+        i = i + 1
+    }
+    return acc
+}
+
+// 空转：保持进程存活以便外部采样峰值内存（同时把值混入 g_acc 防优化掉）
+func spin(iters: i64, seed: i64) -> i64 {
+    var x: i64 = seed
+    var i: i64 = 0
+    while i < iters {
+        x = (x * 6364136223846793005 + 1442695040888963407) & 0x7FFFFFFFFFFFFFFF
+        i = i + 1
+    }
+    return x
+}
+
+func main() {
+    var cs: string = arg_string(0)
+    var n: i64 = 256
+    var rep: i64 = 1
+    if arg_count() > 1 {
+        n = parse_int(arg_string(1))
+    }
+    if arg_count() > 2 {
+        rep = parse_int(arg_string(2))
+    }
+    var path: string = ""
+    if arg_count() > 3 {
+        path = arg_string(3)
+    }
+    // 预建数据（计时之外）
+    if cs == "scan_str" || cs == "scan_table" || cs == "crc_str" ||
+        cs == "crc_table" || cs == "conv_to_table" || cs == "conv_from_table" {
+        g_payload = mk(n)
+        g_pt = zbuf.to_table(g_payload)
+    }
+
+    var r: i64 = 0
+    var acc: i64 = 0
+    while r < rep {
+        if cs == "noop" {
+            acc = acc + 1
+        } else if cs == "mk_str" {
+            acc = acc + op_mk_str(n)
+        } else if cs == "mk_table" {
+            acc = acc + op_mk_table(n)
+        } else if cs == "scan_str" {
+            acc = acc + scan_str(g_payload, n, r + 1)
+        } else if cs == "scan_table" {
+            acc = acc + scan_table(g_pt, n, r + 1)
+        } else if cs == "crc_str" {
+            acc = acc + zd_stream.crc32_str(g_payload)
+        } else if cs == "crc_table" {
+            acc = acc + zd_stream.crc32(g_pt)
+        } else if cs == "conv_to_table" {
+            acc = acc + len(zbuf.to_table(g_payload))
+        } else if cs == "conv_from_table" {
+            acc = acc + len(zbuf.from_table(g_pt))
+        } else if cs == "fread_str" {
+            acc = acc + len(zbuf.file_load(path))
+        } else if cs == "fread_table" {
+            acc = acc + len(byte_read(path))
+        } else if cs == "hold_str" {
+            g_payload = mk(n)
+            acc = acc + spin(40000000, rep + 1) + len(g_payload)
+        } else if cs == "hold_table" {
+            var ht = table_new_i64()
+            var hi: i64 = 0
+            while hi < n {
+                table_push(ht, hi & 0xFF)
+                hi = hi + 1
+            }
+            g_pt = ht
+            acc = acc + spin(40000000, rep + 1) + len(g_pt)
+        }
+        r = r + 1
+    }
+    g_acc = acc
+    println("sink=" + to_string(g_acc))
+}

@@ -21,12 +21,13 @@ tie-side data API, codec bridge, and CLI tooling.*
 |------------|-----------------------------|------------|-------------|
 | **tdata**  | `src/tdata.tie`            | `td`       | tie:data 文本格式解析与写出            |
 | **zd**     | `src/zd.tie`               | `zd`       | tie:zd MessagePack 风格二进制序列化（v2 头） |
+| **zbuf**   | `src/zbuf.tie`             | `zbuf`     | **原始字节缓冲抽象**（字符串载体 1× vs `table<i64>` 8×；读写原语 + 边界互换 + 1× 文件 I/O）|
 | **vec**    | `src/vec.tie`              | `vecsearch`| Flat 向量检索（L2、cosine、top-k）     |
 | **codec**  | `src/codec.tie`            | `tdc`      | tdata↔zd 编解码桥（节点 encode/decode）|
 | **zd_builder** | `src/zd_builder.tie`   | —          | zd 批量构建（i64/f64/string 批量编解码）|
 | **zd_ext** | `src/zd_ext.tie`           | —          | zd 扩展（null/optional 0xc0、ext 0xd7、schema 与内容 hash 段）|
 | **zd_extra** | `src/zd_extra.tie`       | —          | zd 增强（string dict、列式容器、零拷贝视图、offset 表）|
-| **zd_stream** | `src/zd_stream.tie`     | —          | zd 流式（CRC32、分块帧、解压声明）    |
+| **zd_stream** | `src/zd_stream.tie`     | —          | zd 流式（CRC32、分块帧、解压声明；**帧载体 = 字符串** 1×）|
 | **zd_v3** | `src/zd_v3.tie`             | `zd_v3`    | **zd v3 载体**（头 / 索引 footer / 段表 / 多段文档 / v2+v3 读义务；对齐 zd-java）|
 | **api**    | `src/api.tie`              | —          | 数据 API 层（tdata 节点池设计）        |
 | **json**   | `src/cli/json.tie`         | `json`     | JSON 解析与写出                        |

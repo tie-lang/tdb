@@ -329,7 +329,7 @@ func parse_path(path: string) -> i64 {
 }
 
 // collect_seg：单段收集存活命中到 out。
-func collect_seg(node: i64, kind: i64, key: string, idx: i64, out: table<i64>) {
+func collect_seg(node: i64, kind: i64, key: string, idx: i64, ref out: table<i64>) {
     var t: i64 = td.ty(node)
     if kind == 0 {
         if t == 6 {

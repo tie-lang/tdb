@@ -1,9 +1,18 @@
+type tie<data>
 // 样例数据：羁绊/棋子（td 格式）
-season_id = 3
-{
-    id = 8
-    name = "测试羁绊"
-    tier = 2
-    stats = [10, 20, 30]
-    tags = { key = "value", active = true }
-}
+// td 的定义见规范 §17.1：文件角色 tie<data>，**正文就是 tie 的表字面量**——
+// 裸表 [ ... ] 或带表名 name = [ ... ]，注释用 //，没有 JSON 式的独立语法。
+// （本文件原先写成 `k = v` + `{ ... }`，那不是 td，--compress-data 会直接报错。）
+[
+    "season_id": 3,
+    "bond": [
+        "id": 8,
+        "name": "测试羁绊",
+        "tier": 2,
+        "stats": [10, 20, 30],
+        "tags": [
+            "key": "value",
+            "active": true,
+        ],
+    ],
+]

@@ -1,7 +1,8 @@
 type tie<class>
 // tiedb/src/tdata.tie —— tie:data 解析与写出核心（namespace td）
 // ============================================================================
-// 格式契约：docs/language.md §2 与 compiler/config.tie 权威行为。
+// 格式契约：tie-main/docs/language.md §2（头/内容分离与 tie<data> 角色）与
+// compiler/config.tie 权威行为（规范 §17.1 为 td 的规范基准）。
 //   可选头 type tie<data>；单一根值；表/数组共用 [...]（首条目 "k": v 即表，
 //   空 [] 为数组）；逗号可选容忍尾逗号；// 注释；官方六转义 + \0 \b \f \uXXXX；
 //   整数窄后缀 i8..u128 / 浮点 f32 f64 与指数以字面量原文保真；trit zero；char。

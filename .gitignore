@@ -16,3 +16,10 @@ Thumbs.db
 _tmp_*
 # 探针（本地工作材料，不入库）
 tests/probe_*.tie
+
+# 测试运行残渣
+.flags.zd
+tests/.bad
+tests/.flags.zd
+tests/.v1.zd
+tests/.zd

@@ -14,3 +14,5 @@ Thumbs.db
 .DS_Store
 *.tmp
 _tmp_*
+# 探针（本地工作材料，不入库）
+tests/probe_*.tie

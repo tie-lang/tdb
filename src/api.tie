@@ -58,8 +58,8 @@ pub func open(path: string) -> i64 {
 // 句柄编码：数组下标 + 1（0 保留为非法哨兵）。集合体节点挂在 colls[k]。
 pub func create_collection(conn: i64, name: string, kind: i64) -> i64 {
     var exist: i64 = find_collection(name)
-    if exist >= 0 {
-        return exist + 1
+    if exist > 0 {
+        return exist
     }
     var c: i64 = td.new_map()
     td.push_child(c, "name", td.new_str(name))

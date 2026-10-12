@@ -184,9 +184,14 @@ pub func new_map() -> i64 {
 // ★ 不变量：**g_key 与 g_ch 严格同长、同坐标**——任何 child 都占一个 g_key 位置，
 // 无键位写 ""。key_at 以 g_start（= g_ch 坐标）索引 g_key，两表一旦不同步，
 // 后续所有 map 的键读取整体错位（历史缺陷：曾仅对 map push key）。
+// ★ 契约：同一容器的连续 push 之间**不得插入其它节点的构建**（先收集后统一
+// push，见 parse 的 tmp 收尾）；违反即子块不再连续，此处 fail-fast 显式拒绝。
 pub func push_child(id: i64, key: string, child: i64) {
     if g_cnt[id] == 0 {
         g_start[id] = len(g_ch)
+    }
+    if g_start[id] + g_cnt[id] != len(g_ch) {
+        panic("push_child: 容器子块不连续（push 之间插入了其它节点构建）")
     }
     table_push(g_ch, child)
     table_push(g_key, key)

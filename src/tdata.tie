@@ -180,14 +180,16 @@ pub func new_map() -> i64 {
     return nd(6, 0, "")
 }
 
+// push_child：追加子引用（map 的实际键；数组/无键容器调用者传 ""）。
+// ★ 不变量：**g_key 与 g_ch 严格同长、同坐标**——任何 child 都占一个 g_key 位置，
+// 无键位写 ""。key_at 以 g_start（= g_ch 坐标）索引 g_key，两表一旦不同步，
+// 后续所有 map 的键读取整体错位（历史缺陷：曾仅对 map push key）。
 pub func push_child(id: i64, key: string, child: i64) {
     if g_cnt[id] == 0 {
         g_start[id] = len(g_ch)
     }
     table_push(g_ch, child)
-    if g_ty[id] == 6 {
-        table_push(g_key, key)
-    }
+    table_push(g_key, key)
     g_cnt[id] = g_cnt[id] + 1
 }
 
@@ -232,7 +234,10 @@ pub func alive_cnt(id: i64) -> i64 {
 pub func clone(id: i64) -> i64 {
     var t: i64 = g_ty[id]
     if t == 5 || t == 6 {
-        var copy: i64 = nd(t, 0, "")
+        // 两阶段：先把全部子克隆完（子树占位先落定），后统一 push——
+        // 保证副本的子块在 g_ch 中连续（push_child 连续性契约）。
+        var ks = table_new_string()
+        var kids = table_new_i64()
         var k: i64 = 0
         while k < g_cnt[id] {
             var base: i64 = g_start[id] + k
@@ -240,11 +245,18 @@ pub func clone(id: i64) -> i64 {
                 k = k + 1
                 continue
             }
+            var ck: string = ""
             if t == 6 {
-                push_child(copy, g_key[base], clone(g_ch[base]))
-            } else {
-                push_child(copy, "", clone(g_ch[base]))
+                ck = g_key[base]
             }
+            table_push(ks, ck)
+            table_push(kids, clone(g_ch[base]))
+            k = k + 1
+        }
+        var copy: i64 = nd(t, 0, "")
+        k = 0
+        while k < len(kids) {
+            push_child(copy, ks[k], kids[k])
             k = k + 1
         }
         return copy
@@ -791,9 +803,9 @@ func parse_array_body(depth: i64) -> (i64, i64) {
             var mid: i64 = nd(5, 0, "")
             g_start[mid] = len(g_ch)
             g_cnt[mid] = len(tmp_vals)
-                table_push(g_key, "")
             var k: i64 = 0
             while k < len(tmp_vals) {
+                table_push(g_key, "")        // 数组位置无键：占位（维持 g_key/g_ch 同长）
                 table_push(g_ch, tmp_vals[k])
                 k = k + 1
             }

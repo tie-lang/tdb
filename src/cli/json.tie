@@ -300,12 +300,12 @@ func jp_number() -> i64 {
     if !jp_eof() && jp_peek() == "-" {
         jp_adv()
     }
-    var any: bool = false
+    var any_digit: bool = false
     while jp_is_digit() {
-        any = true
+        any_digit = true
         jp_adv()
     }
-    if !any {
+    if !any_digit {
         return -1
     }
     if !jp_eof() && jp_peek() == "." {
@@ -350,6 +350,10 @@ func jp_object(depth: i64) -> i64 {
         jp_adv()
         return m
     }
+    // 两阶段：先解析收集全部 (键, 值)（子树占位先落定），后统一 push——
+    // 保证 map 的子块在 g_ch 中连续（push_child 连续性契约）。
+    var ks = table_new_string()
+    var kids = table_new_i64()
     while true {
         jp_skip_ws()
         if jp_eof() || jp_peek() != "\"" {
@@ -369,7 +373,8 @@ func jp_object(depth: i64) -> i64 {
         if v < 0 {
             return -1
         }
-        td.push_child(m, key, v)
+        table_push(ks, key)
+        table_push(kids, v)
         jp_skip_ws()
         if jp_eof() {
             return -1
@@ -380,11 +385,16 @@ func jp_object(depth: i64) -> i64 {
         }
         if jp_peek() == "}" {
             jp_adv()
-            return m
+            break
         }
         return -1
     }
-    return -1
+    var i: i64 = 0
+    while i < len(kids) {
+        td.push_child(m, ks[i], kids[i])
+        i = i + 1
+    }
+    return m
 }
 
 func jp_array(depth: i64) -> i64 {
@@ -395,12 +405,14 @@ func jp_array(depth: i64) -> i64 {
         jp_adv()
         return a
     }
+    // 两阶段（同 jp_object）：先收集全部元素，后统一 push。
+    var kids = table_new_i64()
     while true {
         var v: i64 = jp_value(depth + 1)
         if v < 0 {
             return -1
         }
-        td.push_child(a, "", v)
+        table_push(kids, v)
         jp_skip_ws()
         if jp_eof() {
             return -1
@@ -411,11 +423,16 @@ func jp_array(depth: i64) -> i64 {
         }
         if jp_peek() == "]" {
             jp_adv()
-            return a
+            break
         }
         return -1
     }
-    return -1
+    var i: i64 = 0
+    while i < len(kids) {
+        td.push_child(a, "", kids[i])
+        i = i + 1
+    }
+    return a
 }
 
 func jp_value(depth: i64) -> i64 {

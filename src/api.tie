@@ -496,16 +496,24 @@ func decode_array(bytes: table<i64>, pos: i64) -> (i64, i64) {
     if n < 0 {
         return (-1, -1)
     }
-    var arr: i64 = td.new_array()
     var p: i64 = dp
     var i: i64 = 0
+    // 两阶段：先解码全部子（子树占位先落定），后统一 push——保证子块连续
+    // （push_child 连续性契约，见 tdata.push_child 注释）。
+    var kids = table_new_i64()
     while i < n {
         var (child, np) = decode_value(bytes, p)
         if np < 0 {
             return (-1, -1)
         }
-        td.push_child(arr, "", child)
+        table_push(kids, child)
         p = np
+        i = i + 1
+    }
+    var arr: i64 = td.new_array()
+    i = 0
+    while i < n {
+        td.push_child(arr, "", kids[i])
         i = i + 1
     }
     return (arr, p)
@@ -516,9 +524,11 @@ func decode_map(bytes: table<i64>, pos: i64) -> (i64, i64) {
     if n < 0 {
         return (-1, -1)
     }
-    var m: i64 = td.new_map()
     var p: i64 = dp
     var i: i64 = 0
+    // 两阶段（同 decode_array）：收集 (键, 子) 后统一 push。
+    var ks = table_new_string()
+    var kids = table_new_i64()
     while i < n {
         var (k, kp) = zd.decode_string(bytes, p)
         if kp < 0 {
@@ -528,8 +538,15 @@ func decode_map(bytes: table<i64>, pos: i64) -> (i64, i64) {
         if cp < 0 {
             return (-1, -1)
         }
-        td.push_child(m, k, child)
+        table_push(ks, k)
+        table_push(kids, child)
         p = cp
+        i = i + 1
+    }
+    var m: i64 = td.new_map()
+    i = 0
+    while i < n {
+        td.push_child(m, ks[i], kids[i])
         i = i + 1
     }
     return (m, p)

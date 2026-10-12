@@ -20,6 +20,7 @@ import "./tdata.tie"
 import "./codec.tie"
 import "./vec.tie"
 import "./zd.tie"
+import "./zd_doc.tie"
 
 // ---------- 库状态 ----------
 
@@ -534,15 +535,15 @@ func decode_map(bytes: table<i64>, pos: i64) -> (i64, i64) {
     return (m, p)
 }
 
-// save_zd：库 → zd 二进制文件（encode_node(root) + TIEDBZD 头）。
+// save_zd：库 → zd 二进制文件（encode_node(root)，zd 文档载体）。
 pub func save_zd(path: string) -> bool {
-    return zd.save(path, tdc.encode_node(g_root))
+    return zd.save(path, tdc.encode_node(g_root), 0)
 }
 
 // load_zd：zd 二进制 → 库。
 pub func load_zd(path: string) -> i64 {
-    var bytes: table<i64> = zd.load(path)
-    if len(bytes) == 0 {
+    var (lok, bytes) = zd.load(path)
+    if !lok || len(bytes) == 0 {
         println("tiedb: 载入失败: 非 zd 文件或空文件")
         return -1
     }

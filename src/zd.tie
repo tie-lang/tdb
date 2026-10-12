@@ -8,9 +8,9 @@ type tie<class>
 //   0xd9 str8 / 0xda str16 / 0xdb str32（长度=UTF-8 字节数）；数组 0x90-0x9f /
 //   0xdc / 0xdd；map 0x80-0x8f / 0xde / 0xdf；tie 扩展 0xc4 char（i32 码点）、
 //   0xc5 trit（i8）。record 字段 = varint tag(field_no<<3|wire_type) + 值。
-//   文件头魔数 "TIEDBZD" + 版本 1（8 字节）。
+//   文件载体（zd 文档，头 + 段表 + 索引 footer）见 zd_doc.tie。
 //
-// v2 实现说明（相对旧实现的现代化）：
+// 实现说明：
 //   - 字节读取用 str_byte 直访内部字节 + utf8_seq_len 处理多字节（不再
 //     str_char+char_code 绕路）；
 //   - f64 IEEE 754 位模式：bitcast 原语直写（p.9.6.2；旧数学分解已删除——
@@ -390,6 +390,12 @@ func map_head(n: i64) -> table<i64> {
 // encode_array：通用组装——数组标签 + 元素字节（各元素自带类型标签）。
 pub func encode_array(n: i64, body: table<i64>) -> table<i64> {
     return concat(array_head(n), body)
+}
+
+// encode_map：通用组装——map 标签 + 键值对字节（键 = 字符串编码，值自带类型标签；
+// 与 decode 侧 map_tag / decode_map 路径对称）。
+pub func encode_map(n: i64, body: table<i64>) -> table<i64> {
+    return concat(map_head(n), body)
 }
 
 pub func encode_i64_array(t: table<i64>) -> table<i64> {
@@ -881,80 +887,6 @@ pub func decode_map(t: table<i64>, pos: i64, val_kind: i64) -> (table, table, i6
     return (keys, vals, p)
 }
 
-// ---------- 文件接口（TIEDBZD 魔数头；v2 = 10 字节） ----------
-// v2 头：魔数 "TIEDBZD"(7 字节) + 2 位 base-48 版本数字 d1,d2（各 1 字节，
-//   version = d1*48 + d2；当前 v2 = "02" = [0][2]）+ 1 字节 flags（特性位，
-//   缺省 0：bit0 字典 / bit1 列式 / bit2 ext / bit3 流式 / bit4 压缩变体）。
-//   **flags 字节固定存在**（确定性，避免与 body 歧义；"可选 flags 区"落地为
-//   始终携带、缺省 0）。
-// v1 头（兼容读取）：魔数 + 版本 1（8 字节）。
-// 识别规则：≥10 字节且魔数匹配、d1,d2∈[0,47] → v2；8 字节（魔数 + 0x01）→ v1；
-//   其余非法。
-
-// 头部解析 → (version, header_len, flags)；失败 (-1, -1, -1)。
-//   v1 → (1, 8, 0)（8 字节头 + body）；v2 → (2, 10, flags)。
-pub func header_info(t: table<i64>) -> (i64, i64, i64) {
-    var n: i64 = len(t)
-    if n < 8 {
-        return (-1, -1, -1)
-    }
-    if t[0] != 0x54 || t[1] != 0x49 || t[2] != 0x45 || t[3] != 0x44 ||
-        t[4] != 0x42 || t[5] != 0x5A || t[6] != 0x44 {
-        return (-1, -1, -1)
-    }
-    if t[7] == 0x01 {
-        return (1, 8, 0)      // v1：8 字节头 + body
-    }
-    if n >= 10 && t[7] >= 0 && t[7] <= 47 && t[8] >= 0 && t[8] <= 47 {
-        var version: i64 = t[7] * 48 + t[8]
-        return (version, 10, t[9])
-    }
-    return (-1, -1, -1)
-}
-
-// save：魔数 + "02" + flags(0) + 字节表 → 文件（v2）。成功 true。
-pub func save(path: string, bytes: table<i64>) -> bool {
-    var head = table_new_i64()
-    table_push(head, 0x54)
-    table_push(head, 0x49)
-    table_push(head, 0x45)
-    table_push(head, 0x44)
-    table_push(head, 0x42)
-    table_push(head, 0x5A)
-    table_push(head, 0x44)
-    table_push(head, 0x00)   // d1 = 0
-    table_push(head, 0x02)   // d2 = 2 → version = 0*48 + 2 = 2
-    table_push(head, 0x00)   // flags = 0
-    return byte_write(path, concat(head, bytes))
-}
-
-// save_v1：魔数 + 版本 1 + 字节表 → 文件（v1 兼容回归用）。成功 true。
-pub func save_v1(path: string, bytes: table<i64>) -> bool {
-    var head = table_new_i64()
-    table_push(head, 0x54)
-    table_push(head, 0x49)
-    table_push(head, 0x45)
-    table_push(head, 0x44)
-    table_push(head, 0x42)
-    table_push(head, 0x5A)
-    table_push(head, 0x44)
-    table_push(head, 0x01)
-    return byte_write(path, concat(head, bytes))
-}
-
-// load：读文件 → 校验头部 → 返回去头字节表（v1/v2 均可）。非法文件返回空表。
-pub func load(path: string) -> table<i64> {
-    var data = byte_read(path)
-    var (version, hlen, flags) = header_info(data)
-    if version < 0 {
-        return table_new_i64()
-    }
-    return slice(data, hlen, len(data))
-}
-
-// is_zd：魔数/版本校验（v1/v2 任一合法头部）。
-pub func is_zd(t: table<i64>) -> bool {
-    var (version, hlen, flags) = header_info(t)
-    return version >= 0
-}
+// ---------- 文件接口 ----------
+// （v1/v2 文件接口已废弃删除；zd 文档读写唯一入口 = zd_doc.tie 的 save / load。）
 }

@@ -99,7 +99,7 @@ Run: `tests/probe_zd_perf.exe <case> <scale> <repeat>`；`tests/bench.sh <exe> <
 
 ### 建议 / Recommendation
 
-zd v3 的内部字节缓冲改用**字符串承载 + StringBuilder 组装**，仅在 API 边界转 `table<i64>`；
+zd 的内部字节缓冲改用**字符串承载 + StringBuilder 组装**，仅在 API 边界转 `table<i64>`；
 或新增「原始缓冲 + 偏移/长度」视图类型。前者无需编译器改动即可落地，且同时解决 §3 的
 逐元素成本（解码侧仍受 `table<i64>` 输入限制，故两者宜并行推进）。
 

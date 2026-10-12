@@ -1,5 +1,5 @@
 type tie<class>
-// tiedb/src/zd_ext.tie —— zd v2 扩展能力 + 自描述/完整性里程碑（M5 + M6）
+// tiedb/src/zd_ext.tie —— zd 扩展能力（null/optional、ext、schema 容器、内容哈希）
 // ============================================================================
 // 设计基准 docs/superpowers/specs/2026-08-31-zd-v2-design.md §3/§6：
 //   - null/optional 核心类型（0xc0）：区分「缺失」与「空值」；注意 0xc0 ≠ fixint
@@ -102,26 +102,7 @@ pub func has_flag(flags: i64, bit: i64) -> bool {
     return (flags & (1 << bit)) != 0
 }
 
-// make_header：构造 v2 完整文件头（魔数 + "02" 版本 + flags），供 save 时写 flags。
-pub func make_header(flags: i64) -> table<i64> {
-    var h = table_new_i64()
-    table_push(h, 0x54)
-    table_push(h, 0x49)
-    table_push(h, 0x45)
-    table_push(h, 0x44)
-    table_push(h, 0x42)
-    table_push(h, 0x5A)
-    table_push(h, 0x44)
-    table_push(h, 0x00)   // d1 = 0
-    table_push(h, 0x02)   // d2 = 2 → version = 0*48 + 2 = 2
-    table_push(h, flags)  // flags 字节
-    return h
-}
-
-// save_with_flags：以指定 flags 写 v2 文件（完整文件头 + 字节表）。成功 true。
-pub func save_with_flags(path: string, bytes: table<i64>, flags: i64) -> bool {
-    return byte_write(path, zd.concat(make_header(flags), bytes))
-}
+// （v2 文件头构造与落盘接口已废弃删除；zd 文档读写唯一入口 = zd_doc.tie 的 make_header / save。）
 
 // ---------- schema 段（字段名 + 类型数组的容器段，自描述） ----------
 

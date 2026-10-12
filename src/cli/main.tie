@@ -17,6 +17,7 @@ type tie<logic>
 
 import "../tdata.tie"
 import "../zd.tie"
+import "../zd_doc.tie"
 import "../codec.tie"
 import "./json.tie"
 
@@ -680,7 +681,7 @@ func cmd_compact(args: table<string>, n: i64) -> i64 {
         return 1
     }
     var bytes: table<i64> = tdc.encode_node(root)
-    if zd.save(output, bytes) {
+    if zd.save(output, bytes, 0) {
         println("已压缩 " + output + "（" + to_string(len(bytes)) + " 字节负载）")
         return 0
     }
@@ -707,8 +708,8 @@ func cmd_decompress(args: table<string>, n: i64) -> i64 {
     if str_len(input) == 0 || str_len(output) == 0 {
         return usage("decompress 用法：tiedb decompress <in.zd.tie> -o <out.data.tie>")
     }
-    var bytes: table<i64> = zd.load(input)
-    if len(bytes) == 0 {
+    var (lok, bytes) = zd.load(input)
+    if !lok || len(bytes) == 0 {
         return fail_msg("非 zd 文件或空文件")
     }
     var (root, np) = tdc.decode_value(bytes, 0)

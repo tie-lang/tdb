@@ -9,7 +9,7 @@ type tie<class>
 //     algo：0=无 / 1=zstd / 2=lz4。**只声明不解压**（§10：压缩算法不内嵌实现，
 //     读端据 algo 自行接 zstd/lz4 解压）。
 //   头部 flags：bit3 = 流式（stream_flag() == 8）、bit4 = 压缩变体
-//     （compress_flag() == 16），配合 zd.header_info 读容器头 flags 判定。
+//     （compress_flag() == 16），配合 zd_doc 的 header_flags 读容器头 flags 判定。
 // 字节一律 table<i64>（0..255）；错误哨兵 -1，不 panic。
 // 复用 src/zd.tie 基础原语（u8_at / write_u32_be / read_u32_be / slice）。
 //
@@ -176,7 +176,7 @@ pub func decode_compressed(bytes: string, pos: i64) -> (i64, string, i64) {
     return (algo, zbuf.br_slice(bytes, pos + 2, nb), nb)
 }
 
-// ---------- 头部 flags 位（配合 zd.header_info 判定流式/压缩） ----------
+// ---------- 头部 flags 位（配合 zd_doc.header_flags 判定流式/压缩） ----------
 // 容器头 flags bit3 = 流式、bit4 = 压缩变体。
 pub func stream_flag() -> i64 {
     return 1 << 3

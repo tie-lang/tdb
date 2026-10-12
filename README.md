@@ -3,13 +3,13 @@
 **tieDB — tie 生态数据库完整实现** / *Full database implementation for the tie ecosystem*
 
 tdb 是 tie 生态的数据库组件（原 tieDB/tiedb），提供**列式持久化 + 向量检索
-（vecsearch）**的能力。以 zd v2 二进制格式为底座，覆盖 tie:data（文本）、
+（vecsearch）**的能力。以 zd 二进制格式（v3 文档载体）为底座，覆盖 tie:data（文本）、
 tie:zd（二进制）两种线代格式，并提供 tie 侧数据 API、编解码桥与命令行工具。
 
 *EN: tdb is the database component of the tie ecosystem (formerly tieDB),
-delivering columnar persistence + vector search (vecsearch) over the zd v2
-format, covering both tie:data (text) and tie:zd (binary) wire formats, with a
-tie-side data API, codec bridge, and CLI tooling.*
+delivering columnar persistence + vector search (vecsearch) over the zd format
+(v3 document carrier), covering both tie:data (text) and tie:zd (binary) wire
+formats, with a tie-side data API, codec bridge, and CLI tooling.*
 
 > v2: this repository hosts the **complete** tieDB v2 implementation
 > (p.9.6.1). The former split-component v1 API/persist layout is archived
@@ -20,7 +20,7 @@ tie-side data API, codec bridge, and CLI tooling.*
 | Module     | File                        | Namespace  | Description |
 |------------|-----------------------------|------------|-------------|
 | **tdata**  | `src/tdata.tie`            | `td`       | tie:data 文本格式解析与写出            |
-| **zd**     | `src/zd.tie`               | `zd`       | tie:zd MessagePack 风格二进制序列化（v2 头） |
+| **zd**     | `src/zd.tie`               | `zd`       | tie:zd MessagePack 风格二进制序列化（编码原语 + record；文档载体见 zd_doc） |
 | **zbuf**   | `src/zbuf.tie`             | `zbuf`     | **原始字节缓冲抽象**（字符串载体 1× vs `table<i64>` 8×；读写原语 + 边界互换 + 1× 文件 I/O）|
 | **vec**    | `src/vec.tie`              | `vecsearch`| Flat 向量检索（L2、cosine、top-k）     |
 | **codec**  | `src/codec.tie`            | `tdc`      | tdata↔zd 编解码桥（节点 encode/decode）|
@@ -28,7 +28,7 @@ tie-side data API, codec bridge, and CLI tooling.*
 | **zd_ext** | `src/zd_ext.tie`           | —          | zd 扩展（null/optional 0xc0、ext 0xd7、schema 与内容 hash 段）|
 | **zd_extra** | `src/zd_extra.tie`       | —          | zd 增强（string dict、列式容器、零拷贝视图、offset 表）|
 | **zd_stream** | `src/zd_stream.tie`     | —          | zd 流式（CRC32、分块帧、解压声明；**帧载体 = 字符串** 1×）|
-| **zd_v3** | `src/zd_v3.tie`             | `zd_v3`    | **zd v3 载体**（头 / 索引 footer / 段表 / 多段文档 / v2+v3 读义务；对齐 zd-java）|
+| **zd_doc** | `src/zd_doc.tie`            | `zd`       | **zd 文档格式**（头 / 索引 footer / 段表 / 多段文档 / 文件读写；v1/v2 已废弃；对齐 zd-java）|
 | **api**    | `src/api.tie`              | —          | 数据 API 层（tdata 节点池设计）        |
 | **json**   | `src/cli/json.tie`         | `json`     | JSON 解析与写出                        |
 | **cli**    | `src/cli/main.tie`         | —          | 九命令 CLI 工具                        |
@@ -49,17 +49,17 @@ tiedb decompress <in.zd.tie> -o <out.data.tie>
 
 ## 测试 / Tests
 
-`tests/` 下约 30 个探针（probe_*.tie），覆盖 tdata 解析/格式化、zd v2 头与
-往返、批量构建（builder）、ext/extra/stream 扩展、向量检索等。用 tiec 编译运行：
+`tests/` 下约 30 个探针（probe_*.tie），覆盖 tdata 解析/格式化、zd 头与
+文档往返、批量构建（builder）、ext/extra/stream 扩展、向量检索等。用 tiec 编译运行：
 
 ```bash
-tiec tests/probe_zd_v2.tie -o tests/probe_zd_v2.exe
-tests/probe_zd_v2.exe
+tiec tests/probe_zd_doc.tie -o tests/probe_zd_doc.exe
+tests/probe_zd_doc.exe
 ```
 
-*EN: ~30 probes under `tests/` cover tdata parsing/formatting, the zd v2 header
-and round-trips, batch building, the ext/extra/stream extensions, and vector
-search. Compile and run with tiec as shown above.*
+*EN: ~30 probes under `tests/` cover tdata parsing/formatting, the zd header
+and document round-trips, batch building, the ext/extra/stream extensions, and
+vector search. Compile and run with tiec as shown above.*
 
 ## 构建 / Build
 

@@ -1,17 +1,15 @@
 type tie<class>
-// tiedb/src/zd_v3.tie —— zd v3 载体（namespace zd_v3，纯 tie 实现）
+// tiedb/src/zd_doc.tie —— zd 文档格式（v3 为唯一版本，namespace zd，纯 tie 实现）
 // ============================================================================
 // 对齐权威实现 zd-java（tie-lang/zd-java，0.2.0）与语言规范 §17.2 /
-// `2026-09-28-zd-v3-design.md`。本文件实现 v3 **骨架面**：头 / 索引 footer /
+// `2026-09-28-zd-v3-design.md`。本文件实现文档层：头 / 索引 footer /
 // 段表 / 多段文档；列式编码族（段类型 2）与字符串池（段类型 1）复用 zd_extra 的
 // 既实现，schema 段（类型 3）与图容器（类型 4）见后续分片。
 //
-// v3 纪律（写方默认 v3；v2 布局全兼容）：
-//   - 头 10 字节 = "TIEDBZD"(7) + base-48 版本两位（v2 = 0x00 0x02、v3 = 0x00 0x03）
-//     + flags 1 字节；**读义务 = v2 + v3**（两者都接受），**写方禁写 v1**。
-//   - flags：v2 五位（bit0 字典 / bit1 列式 / bit2 ext / bit3 流式 / bit4 压缩变体）
-//     之上新增 bit5 索引 footer、bit6 图容器（纯提示位）；**v3 写侧掩码 = 低 7 位**，
-//     v2 路径低 5 位。
+// 格式纪律（v3 唯一版本；v1/v2 已废弃，读写均不接受）：
+//   - 头 10 字节 = "TIEDBZD"(7) + base-48 版本两位（v3 = 0x00 0x03）+ flags 1 字节。
+//   - flags（低 7 位）：bit0 字典 / bit1 列式 / bit2 ext / bit3 流式 / bit4 压缩变体
+//     / bit5 索引 footer / bit6 图容器（纯提示位）。
 //   - 索引 footer 25 字节 = "ZD3FT"(5) + index_off(u64 BE) + index_len(u64 BE)
 //     + crc32(u32 BE)；crc32 覆盖**索引段**字节。
 //   - 段表 = varint 段数 + 各段 [类型 varint][文件内偏移 u64 BE][长度 u64 BE]
@@ -31,7 +29,7 @@ import "./zd_stream.tie"
 import "./zd_ext.tie"
 import "/std/tsha1.tie"
 
-namespace zd_v3 {
+namespace zd {
 
 // ---------- 常量 ----------
 
@@ -44,7 +42,7 @@ pub func seg_graph() -> i64 { return 4 }
 pub func seg_compressed() -> i64 { return 5 }
 pub func seg_custom() -> i64 { return 6 }
 
-// flags 位（v3 低 7 位；v2 路径低 5 位）。
+// flags 位（低 7 位）。
 pub func flag_dictionary() -> i64 { return 1 }        // bit0
 pub func flag_columnar() -> i64 { return 1 << 1 }     // bit1
 pub func flag_ext() -> i64 { return 1 << 2 }          // bit2
@@ -52,65 +50,51 @@ pub func flag_stream() -> i64 { return 1 << 3 }       // bit3
 pub func flag_compressed() -> i64 { return 1 << 4 }   // bit4
 pub func flag_index() -> i64 { return 1 << 5 }        // bit5（索引 footer）
 pub func flag_graph() -> i64 { return 1 << 6 }        // bit6（纯提示位）
-pub func flags_mask_v3() -> i64 { return 0x7F }       // 低 7 位
-pub func flags_mask_v2() -> i64 { return 0x1F }       // 低 5 位
+pub func flags_mask() -> i64 { return 0x7F }          // 低 7 位
 
 // footer 长度（25 字节）。
 pub func footer_len() -> i64 { return 25 }
 
-// v3 版本两位（base-48 高位在前 → version = 0*48 + 3 = 3）。
-pub func version_v3() -> i64 { return 3 }
-
 // ---------- 头（10 字节） ----------
 
-// make_header_v3：魔数 + "03" + flags（低 7 位掩码）。单次分配字面量构造。
-pub func make_header_v3(flags: i64) -> table<i64> {
+// make_header：魔数 + "03" + flags（低 7 位掩码）。单次分配字面量构造。
+pub func make_header(flags: i64) -> table<i64> {
     var f = flags & 0x7F
     return [0x54, 0x49, 0x45, 0x44, 0x42, 0x5A, 0x44, 0x00, 0x03, f]
 }
 
 // header_version：头部版本号（base-48 两位 → d1*48 + d2）。
-// v1（8 字节头，魔数 + 0x01）返回 1；v2/v3 返回 2/3；非法返回 -1。
-// **读义务 = v2 + v3**：v1 头仍被识别（读兼容），但 v3 写方禁写 v1。
+// 仅 v3 合法（返回 3）；其余（含已废弃的 v1/v2）一律 -1。
 pub func header_version(t: table<i64>) -> i64 {
-    if len(t) < 8 {
+    if len(t) < 10 {
         return -1
     }
     if t[0] != 0x54 || t[1] != 0x49 || t[2] != 0x45 || t[3] != 0x44 ||
         t[4] != 0x42 || t[5] != 0x5A || t[6] != 0x44 {
         return -1
     }
-    if t[7] == 0x01 {
-        return 1
-    }
-    if len(t) < 10 || t[7] < 0 || t[7] > 47 || t[8] < 0 || t[8] > 47 {
+    if t[7] < 0 || t[7] > 47 || t[8] < 0 || t[8] > 47 {
         return -1
     }
-    return t[7] * 48 + t[8]
+    var version = t[7] * 48 + t[8]
+    if version != 3 {
+        return -1
+    }
+    return version
 }
 
-// header_flags：头部 flags 字节（非法头返回 -1；v1 无 flags → 0）。
+// header_flags：头部 flags 字节（非法头返回 -1）。
 pub func header_flags(t: table<i64>) -> i64 {
     var v = header_version(t)
     if v < 0 {
         return -1
     }
-    if v == 1 {
-        return 0
-    }
     return t[9]
 }
 
-// is_v3：是否 v3 头（严格 version == 3）。
-pub func is_v3(t: table<i64>) -> bool {
+// is_zd：是否合法 zd 文档头（严格 version == 3）。
+pub func is_zd(t: table<i64>) -> bool {
     return header_version(t) == 3
-}
-
-// accept_v2_or_v3：读义务判据——v2/v3 任一合法头即接受（v1 头不在此列，
-// 但 header_version 仍可识别它以支持既有 v1 读路径）。
-pub func accept_v2_or_v3(t: table<i64>) -> bool {
-    var v = header_version(t)
-    return v == 2 || v == 3
 }
 
 // ---------- 索引 footer（25 字节） ----------
@@ -340,7 +324,7 @@ pub func assemble(flags: i64, types: table<i64>, blob: table<i64>,
     if len(index) == 0 {
         return table_new_i64()
     }
-    var out = make_header_v3(hf)
+    var out = make_header(hf)
     out = zd.concat(out, blob)
     var index_off: i64 = len(out)
     out = zd.concat(out, index)
@@ -352,7 +336,7 @@ pub func assemble(flags: i64, types: table<i64>, blob: table<i64>,
 
 // read_index：经 footer 段表定位段（**校验并解出段表，不切载荷**）→
 //   (ok, types, abs_offsets, lens, names)。ok=false 时四表为空。
-// 一致性门（任一不成立 → ok=false）：无 footer；非 v3；bit5 未置位；crc 不符；
+// 一致性门（任一不成立 → ok=false）：无 footer；非法头；bit5 未置位；crc 不符；
 //   段偏移/长度越界（越出「段载荷区」，即不得进入索引段/footer）。
 // **footer 存在时必须经索引定位、不得假设段序**——消费方据返回的段表自行定位。
 pub func read_index(data: table<i64>) -> (bool, table<i64>, table<i64>, table<i64>, table<string>) {
@@ -362,7 +346,7 @@ pub func read_index(data: table<i64>) -> (bool, table<i64>, table<i64>, table<i6
     if !has {
         return (false, empty_t, empty_t, empty_t, empty_n)
     }
-    if !is_v3(data) {
+    if !is_zd(data) {
         return (false, empty_t, empty_t, empty_t, empty_n)
     }
     if (header_flags(data) & (1 << 5)) == 0 {
@@ -761,8 +745,8 @@ pub func decode_schema(bytes: table<i64>, pos: i64) -> (bool, table<i64>, table<
 }
 
 // ==================== 标准类型三件（ext 固定标记） ====================
-// 对齐 zd-java ZdStandard（语言规范 §17.2）：v3 实现**强制支持**，v2 读取方按未知 ext
-// 整体跳过。ext 形态 = 0xd7 + 标记 varint + 长度 varint + 载荷（复用 zd_ext.encode_ext）。
+// 对齐 zd-java ZdStandard（语言规范 §17.2）：实现**强制支持**，未知 ext
+// 按未知识别处理（消费方整体跳过）。ext 形态 = 0xd7 + 标记 varint + 长度 varint + 载荷（复用 zd_ext.encode_ext）。
 //   · timestamp（标记 1）：8 字节 Unix 纪元秒 i64 大端 + 4 字节纳秒 u32 大端；
 //     纳秒 ∈ [0, 999999999]。
 //   · decimal（标记 2）：[符号 1 字节][指数 i8 1 字节][十进制数字串 UTF-8]；
@@ -911,7 +895,7 @@ pub func decode_uuid(ext: table<i64>) -> (bool, i64, i64) {
     return (true, msb, lsb)
 }
 
-// std_tag_of：ext 值的标记（未知/非法 → -1）。v2 读取方按未知标记整体跳过。
+// std_tag_of：ext 值的标记（未知/非法 → -1）。未知标记由消费方整体跳过。
 pub func std_tag_of(ext: table<i64>) -> i64 {
     var (tag, p, nx) = zd_ext.decode_ext(ext, 0)
     if nx < 0 {
@@ -1206,10 +1190,10 @@ pub func graph_decode_edges(b: table<i64>, p_edges: i64, nn: i64, ne: i64,
     return (true, p)
 }
 
-// ---------- 文件接口（v3，禁写 v1） ----------
+// ---------- 文件接口（zd 文档读写） ----------
 
-// save_v3：单段数据体文件（段类型 0）→ 路径。成功 true。
-pub func save_v3(path: string, body: table<i64>, flags: i64) -> bool {
+// save：单段数据体文档（段类型 0）→ 路径。成功 true。
+pub func save(path: string, body: table<i64>, flags: i64) -> bool {
     var types = table_new_i64()
     var soffs = table_new_i64()
     var slens = table_new_i64()
@@ -1225,8 +1209,8 @@ pub func save_v3(path: string, body: table<i64>, flags: i64) -> bool {
     return byte_write(path, doc)
 }
 
-// load_v3：v3 文件 → (ok, 首段数据体)。用于单段最小路径；多段用 read_segments。
-pub func load_v3(path: string) -> (bool, table<i64>) {
+// load：zd 文件 → (ok, 首段数据体)。用于单段最小路径；多段用 read_index + segment_bytes。
+pub func load(path: string) -> (bool, table<i64>) {
     var data = byte_read(path)
     var (ok, types, offs, lens, names) = read_index(data)
     if !ok {

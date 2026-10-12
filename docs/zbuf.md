@@ -106,10 +106,10 @@ tie 里表示「一串字节」长期有两种做法，代价差异极大：
 
 ---
 
-## 五、与 `zd` / `zd_v3` 的关系 / Relation to zd
+## 五、与 `zd` / `zd_doc` 的关系 / Relation to zd
 
 `zbuf` 只做**原始字节**搬运，**不做**码点 ↔ UTF-8 转换（那是 `zd.utf8_encode` 的文本语义）。
 `zd.write_varint` / `write_u64_be` / `write_f64_be` 与本模块的写端**逐字节同值**
 （`tests/probe_zbuf.tie` 有交叉断言），因此两种载体可安全互通。
-`zd_v3`（v3 容器）目前仍以 `table<i64>` 承载字节；其内部层整体迁到字符串载体是
+`zd_doc`（文档层容器）目前仍以 `table<i64>` 承载字节；其内部层整体迁到字符串载体是
 后续项（见 trm-lite `docs/2026-09-29-tie-perf-safety-and-startup.md` §2.3）。

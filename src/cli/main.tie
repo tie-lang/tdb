@@ -16,8 +16,8 @@ type tie<logic>
 // 注意：text / code 为 tie 保留类型关键字，禁止作标识符。
 
 import "../tdata.tie"
-import "../zd.tie"
-import "../zd_doc.tie"
+import "/std/zd.tie"
+import "/std/zd_doc.tie"
 import "../codec.tie"
 import "./json.tie"
 

@@ -7,7 +7,7 @@ type tie<class>
 // 超 i64 大数文本有损，限制注明）。本模块无全局状态。
 
 import "./tdata.tie"
-import "./zd.tie"
+import "/std/zd.tie"
 
 namespace tdc {
 

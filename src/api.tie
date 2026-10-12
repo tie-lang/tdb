@@ -19,8 +19,8 @@ type tie<class>
 import "./tdata.tie"
 import "./codec.tie"
 import "./vec.tie"
-import "./zd.tie"
-import "./zd_doc.tie"
+import "/std/zd.tie"
+import "/std/zd_doc.tie"
 
 // ---------- 库状态 ----------
 
